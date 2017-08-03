@@ -16,7 +16,7 @@ def last_day_of_month(any_day):
 
 
 def dater(income_text, text, chat_id):
-    query = Query(chat_id)  # TODO: make login pass
+    query = Query(chat_id)
 
     today = query.dw.get_client_info()['date_to']
     if income_text == text['period_values'][0]:

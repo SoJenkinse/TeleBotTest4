@@ -1,5 +1,8 @@
 from telebot import types
 import json
+import time
+
+time_test = {}
 
 
 def get_text(language='RU'):
@@ -40,3 +43,4 @@ def create_pagination_markup(values, text, chunk_len=50, page_number=0):
         else:
             markup.add(values[i], values[i + 1])
     return markup
+

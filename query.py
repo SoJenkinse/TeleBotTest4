@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import json
 from datetime import datetime, timedelta
 from db_model import UserMap, Session
 from utils import get_text
@@ -8,8 +7,6 @@ from utils import get_text
 
 import redis
 from dwapi import datawiz
-import pandas as pd
-import os.path
 
 import matplotlib
 matplotlib.use("agg")  # switch to png mode
@@ -26,11 +23,11 @@ class Query:
         self.dw = datawiz.DW(user.login, user.password)
         self.chat_id = chat_id
 
-        self.query_type = 'all'
-        self.shop = 'all'
-        self.category = self.dw.get_client_info()['root_category']
-        self.date_from = self.dw.get_client_info()['date_from']
-        self.date_to = self.dw.get_client_info()['date_to']
+        self.query_type = None
+        self.shop = None
+        self.category = None
+        self.date_from = None
+        self.date_to = None
 
     def set_info(self, query_type, shop, category, date_from, date_to):
         self.query_type = query_type
@@ -39,12 +36,19 @@ class Query:
         self.date_from = date_from
         self.date_to = date_to
 
-    def set_default_info(self):
+    def set_cache_default(self):
         self.query_type = 'all'
         self.shop = 'all'
         self.category = self.dw.get_client_info()['root_category']
-        self.date_from = self.dw.get_client_info()['date_from']
+
         self.date_to = self.dw.get_client_info()['date_to']
+        self.date_from = self.date_to - timedelta(30)
+
+        r_server.hset(self.chat_id, 'shop', 'all')
+        r_server.hset(self.chat_id, 'category', self.category)
+        r_server.hset(self.chat_id, 'date_from', self.date_from)
+        r_server.hset(self.chat_id, 'date_to', self.date_to)
+        r_server.hset(self.chat_id, 'visualization', 'None')
 
     def set_info_cache(self):
         self.query_type = r_server.hget(self.chat_id, 'type')
@@ -83,6 +87,7 @@ class Query:
         if frame.empty is True:
             return None
         del frame['category'], frame['name']
+        frame.name = shop
         return frame
 
     def get_shops(self):
@@ -102,14 +107,20 @@ class Query:
 
     # get list of categories
     def get_categories(self):
-        list_len = r_server.llen('category#' + str(self.chat_id))
-        return sorted(r_server.lrange('category#' + str(self.chat_id), 0, list_len))
+        categories = self.dw.search(query="", by="category", level=2)
+        return sorted(categories.values())
 
     def show_query(self):
-        print('QUERY', self.query_type, self.shop, self.category, self.date_from, self.date_to)
+        message = '{5} QUERY {0}, {1}, {2}, {3}, {4}'.format(self.query_type,
+                                                         self.shop,
+                                                         self.category,
+                                                         self.date_from,
+                                                         self.date_to,
+                                                         self.chat_id)
+        return message
 
     def type_translate(self, type_string):
-        text = get_text(self.chat_id)
+        text = get_text(r_server.hget(self.chat_id, 'localization'))
         type_map = {'turnover': text['types_values'][0],
                     'qty': text['types_values'][1],
                     'profit': text['types_values'][2],
