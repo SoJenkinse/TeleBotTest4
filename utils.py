@@ -1,12 +1,27 @@
+from settings import r_server
+
 from telebot import types
 import json
-import time
+from db_model import Session, UserMap
+from sqlalchemy.orm.exc import NoResultFound
 
 time_test = {}
 
 
-def get_text(language='RU'):
-    if language == 'UA':
+def get_text(chat_id, language = 'ua', force = False):
+    if force is False:
+        try:
+            session = Session()
+            login = r_server.hget(chat_id, 'login')
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+            language = user.lang
+            session.close()
+        except NoResultFound:
+            print('get_text NoResultFound')
+
+        if language is None:
+            return None
+    if language == 'ua':
         path_lang = 'localization/ua.json'
     else:
         path_lang = 'localization/ru.json'
@@ -29,6 +44,8 @@ def create_markup(values):
 
 def create_pagination_markup(values, text, chunk_len=50, page_number=0):
     markup = types.ReplyKeyboardMarkup(one_time_keyboard=True)
+
+    values[1:] = sorted(values[1:])
 
     if len(values) > chunk_len:
         values = [values[x:x + chunk_len] for x in range(0, len(values), chunk_len)]

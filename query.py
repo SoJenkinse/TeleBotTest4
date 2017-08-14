@@ -3,31 +3,39 @@
 from datetime import datetime, timedelta
 from db_model import UserMap, Session
 from utils import get_text
-
+import logging
+import pandas as pd
+from settings import r_server
 
 import redis
 from dwapi import datawiz
+from sqlalchemy.orm.exc import NoResultFound
 
 import matplotlib
 matplotlib.use("agg")  # switch to png mode
 
-r_server = redis.Redis('localhost')
-
+import time
 
 class Query:
-    def __init__(self, chat_id):
-        session = Session()
-        user = session.query(UserMap).filter(UserMap.chat_id == chat_id).one()
-        session.close()
+    def __init__(self, chat_id, login=None):
+        try:
+            if login is None:
+                login = r_server.hget(chat_id, 'login')
 
-        self.dw = datawiz.DW(user.login, user.password)
-        self.chat_id = chat_id
+            session = Session()
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+            session.close()
 
-        self.query_type = None
-        self.shop = None
-        self.category = None
-        self.date_from = None
-        self.date_to = None
+            self.dw = datawiz.DW(user.login, user.password)
+            self.chat_id = chat_id
+
+            self.query_type = None
+            self.shop = None
+            self.category = None
+            self.date_from = None
+            self.date_to = None
+        except NoResultFound:
+            logging.error('NoResultFound query')
 
     def set_info(self, query_type, shop, category, date_from, date_to):
         self.query_type = query_type
@@ -36,13 +44,15 @@ class Query:
         self.date_from = date_from
         self.date_to = date_to
 
-    def set_cache_default(self):
+    def set_cache_default(self, login=None):
         self.query_type = 'all'
         self.shop = 'all'
         self.category = self.dw.get_client_info()['root_category']
-
         self.date_to = self.dw.get_client_info()['date_to']
-        self.date_from = self.date_to - timedelta(30)
+        self.date_from = self.date_to - timedelta(29)
+
+        if login is not None:
+            r_server.hset(self.chat_id, 'login', login)
 
         r_server.hset(self.chat_id, 'shop', 'all')
         r_server.hset(self.chat_id, 'category', self.category)
@@ -51,16 +61,19 @@ class Query:
         r_server.hset(self.chat_id, 'visualization', 'None')
 
     def set_info_cache(self):
-        self.query_type = r_server.hget(self.chat_id, 'type')
-        self.shop = r_server.hget(self.chat_id, 'shop')
-        self.category = int(r_server.hget(self.chat_id, 'category'))
+        try:
+            self.query_type = r_server.hget(self.chat_id, 'type')
+            self.shop = r_server.hget(self.chat_id, 'shop')
+            self.category = r_server.hget(self.chat_id, 'category')
 
-        date_from = r_server.hget(self.chat_id, 'date_from')
-        date_to = r_server.hget(self.chat_id, 'date_to')
+            date_from = r_server.hget(self.chat_id, 'date_from')
+            date_to = r_server.hget(self.chat_id, 'date_to')
 
-        mask = "%Y-%m-%d %H:%M:%S"
-        self.date_from = datetime.strptime(date_from, mask)
-        self.date_to = datetime.strptime(date_to, mask)
+            mask = "%Y-%m-%d %H:%M:%S"
+            self.date_from = datetime.strptime(date_from, mask)
+            self.date_to = datetime.strptime(date_to, mask)
+        except TypeError:
+            self.set_cache_default()
 
     def make_query(self):
         query_type = self.query_type
@@ -76,19 +89,92 @@ class Query:
         date_from = self.date_from
         date_to = self.date_to
         category = self.category
+        category = int(category)
 
         frame = self.dw.get_categories_sale(by=query_type,
                                            shops=shop,
                                            date_from=date_from,
                                            date_to=date_to,
-                                           categories=int(category),
+                                           categories=category,
                                            view_type='raw'
                                            )
         if frame.empty is True:
             return None
-        del frame['category'], frame['name']
+
+        # create percent of difference
+        date_from_diff = date_from - (date_to - date_from) - timedelta(1)
+        date_to_diff = date_from - timedelta(1)
+        prev_frame = self.dw.get_categories_sale(by=query_type,
+                                           shops=shop,
+                                           date_from=date_from_diff,
+                                           date_to=date_to_diff,
+                                           categories=category,
+                                           view_type='raw'
+                                           )
+
+        current_frame = frame.copy().sum()
+        prev_frame = prev_frame.sum()
+
+        del prev_frame['category'], prev_frame['date'], prev_frame['name']
+        del current_frame['category'], current_frame['date'], current_frame['name']
+
+        result_diff_frame = (current_frame / prev_frame)*100 - 100
+        frame = frame.rename(columns={'name':'cat_name'})
+        frame = frame.append(result_diff_frame, ignore_index=True)
+        del frame['category']
         frame.name = shop
         return frame
+
+    def make_all_shops_query(self):
+        query_type = self.query_type
+        if query_type == 'all':
+            query_type = ['turnover', 'qty', 'profit', 'receipts_qty']
+
+        date_from = self.date_from
+        date_to = self.date_to
+
+        category = self.category
+        category = int(category)
+
+        shops = self.dw.get_client_info()['shops'].keys()
+        frames = []
+        for shop in shops:
+            frame = self.dw.get_categories_sale(categories=category,
+                                           by=query_type,
+                                           shops=shop,
+                                           date_from=date_from,
+                                           date_to=date_to,
+                                           view_type='raw'
+                                           )
+            if frame.empty is False:
+                # create percent of difference
+                date_from_diff = date_from - (date_to - date_from) - timedelta(1)
+                date_to_diff = date_from - timedelta(1)
+
+                prev_frame = self.dw.get_categories_sale(by=query_type,
+                                                         shops=shop,
+                                                         date_from=date_from_diff,
+                                                         date_to=date_to_diff,
+                                                         categories=category,
+                                                         view_type='raw'
+                                                         )
+
+                current_frame = frame.copy().sum()
+                prev_frame = prev_frame.sum()
+
+                del current_frame['category'], current_frame['date'], current_frame['name']
+                del prev_frame['category'], prev_frame['date'], prev_frame['name']
+
+                result_diff_frame = (current_frame / prev_frame) * 100 - 100
+                frame = frame.groupby('date', as_index=False).sum()
+                frame = frame.append(result_diff_frame, ignore_index=True)
+
+                del frame['category']
+                frame['shop_name'] = self.id_shop2name(shop)
+                frames.append(frame)
+
+        mainframe = pd.concat(frames)
+        return mainframe
 
     def get_shops(self):
         return sorted(self.dw.get_client_info()['shops'].values())
@@ -110,6 +196,10 @@ class Query:
         categories = self.dw.search(query="", by="category", level=2)
         return sorted(categories.values())
 
+    def get_categories_id(self):
+        categories = self.dw.search(query="", by="category", level=2)
+        return sorted(categories.keys())
+
     def show_query(self):
         message = '{5} QUERY {0}, {1}, {2}, {3}, {4}'.format(self.query_type,
                                                          self.shop,
@@ -120,7 +210,7 @@ class Query:
         return message
 
     def type_translate(self, type_string):
-        text = get_text(r_server.hget(self.chat_id, 'localization'))
+        text = get_text(self.chat_id)
         type_map = {'turnover': text['types_values'][0],
                     'qty': text['types_values'][1],
                     'profit': text['types_values'][2],
@@ -130,30 +220,3 @@ class Query:
 
 if __name__ == '__main__':
     pass
-    # login = raw_input('login: ')
-    # password = raw_input('password: ')
-    # query = Query(login, password)
-    # root_category = query.dw.get_client_info()['root_category']
-    # query.set_info('all',
-    #                     641,
-    #                     root_category,
-    #                     datetime(2015,9,10),
-    #                     datetime(2015,10,10))
-    # result = query.make_query()
-    # print('r-1',result)
-    #
-    # query.set_info('all',
-    #                     'all',
-    #                     root_category,
-    #                     datetime(2015,9,10),
-    #                     datetime(2015,10,10))
-    # result = query.make_query()
-    # print('r-2',result)
-    #
-    # query.set_info('turnover',
-    #                     641,
-    #                     root_category,
-    #                     datetime(2015,9,10),
-    #                     datetime(2015,10,10))
-    # result = query.make_query()
-    # print('r-3',result)

@@ -6,6 +6,7 @@ import os
 import logging
 import datetime
 import time
+import pprint
 
 from settings import *
 from utils import get_text, create_markup, create_pagination_markup
@@ -30,9 +31,7 @@ import matplotlib.pyplot as plt
 from openpyxl import load_workbook
 import pandas as pd
 
-bot = telebot.TeleBot(TOKEN)
-server = flask.Flask('localhost')
-r_server = redis.Redis('localhost')
+
 current_shown_dates = {}
 time_storage = {}
 
@@ -40,21 +39,36 @@ time_storage = {}
 def sign_in(login, password, chat_id):
     start = time.time()
     session = Session()
-    try:
-        session.query(UserMap).filter(UserMap.chat_id == chat_id).delete()
-        datawiz.DW(login, password)
-        new_user = UserMap(chat_id=chat_id,
-                           login=login,
-                           password=password)
-        session.add(new_user)
-        session.commit()
 
-        query = Query(chat_id)
-        query.set_cache_default()
+    # sign out prev authentication if needed
+    try:
+        user = session.query(UserMap).filter_by(chat_id=chat_id, sign_in=True).one()
+        user.sign_in = False
+        session.commit()
+    except NoResultFound:
+        pass
+
+    try:
+        datawiz.DW(login, password)
     except InvalidGrantError:
         return False
+
+    try:
+        user = session.query(UserMap).filter(UserMap.login == login).one()
+        user.sign_in = True
+    except NoResultFound:
+        user = UserMap(chat_id = chat_id,
+                       login = login,
+                       password = password,
+                       sign_in = True)
+        session.add(user)
     finally:
+        session.commit()
         session.close()
+
+        query = Query(chat_id, login)
+        query.set_cache_default(login)
+
         end = time.time() - start
         time_storage[inspect.stack()[0][3]] = end
     return True
@@ -74,21 +88,28 @@ def check_message(message):
 def sign_out(chat_id, text):
     start = time.time()
     markup = types.ReplyKeyboardRemove()
+
+    if text is None:
+        text = get_text(chat_id, force=True)
+
     bot.send_message(chat_id, text[u'you_leave'], reply_markup=markup)
 
     try:
+        # sign_in to False
+        session = Session()
+        login = r_server.hget(chat_id, 'login')
+        user = session.query(UserMap).filter(UserMap.login == login).one()
+        user.sign_in = False
+        session.commit()
+        session.close()
+
         # clear cache
         r_server.delete(chat_id)
         r_server.delete('category#' + str(chat_id))
 
-        # delete from table
-        session = Session()
-        user = session.query(UserMap).filter(UserMap.chat_id == chat_id).one()
-        session.delete(user)
-        session.commit()
-        session.close()
-    except:
-        print('No Result Found')
+    except NoResultFound:
+        print('sign_out NoResultFound')
+
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
 
@@ -129,13 +150,21 @@ def process_login(message):
         bot.send_message(chat_id, u'Невірний логін чи пароль. Спробуйте ще раз')
         return
 
-    # create values for new markup
-    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
+    text = get_text(chat_id)
+    if text is not None:
+        # create new markup, types
+        markup = create_markup(text[u'types_values'])
+        msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
+        bot.register_next_step_handler(msg, process_type)
+    else:
+        # create values for new markup
+        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
 
-    msg = bot.send_message(chat_id, u'Ласкаво просимо %s! Будь ласка, виберіть мову' % login, reply_markup=markup)
-    logging.info(u'ENTER ' + str(chat_id) + u' ' + login)
-    bot.register_next_step_handler(msg, process_language)
+        msg = bot.send_message(chat_id, u'Ласкаво просимо %s! Будь ласка, виберіть мову' % login, reply_markup=markup)
+        logging.info(u'ENTER ' + str(chat_id) + u' ' + login)
+        bot.register_next_step_handler(msg, process_language)
+
     save_state(chat_id)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
@@ -143,13 +172,13 @@ def process_login(message):
 
 @bot.message_handler(func= lambda m: m.text.lower() == u'выход' or m.text.lower() == u'вихід')
 def process_exit(message):
-    start = time.time()
-    chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
-    sign_out(chat_id, text)
-    logging.info(u'EXIT ' + str(chat_id))
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        start = time.time()
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+        sign_out(chat_id, text)
+        logging.info(u'EXIT ' + str(chat_id))
+        end = time.time() - start
+        time_storage[inspect.stack()[0][3]] = end
 
 
 @bot.message_handler(commands=['speed_test'])
@@ -178,16 +207,23 @@ def process_language(message):
         # create values for new markup
         markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
         markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
-        msg = bot.send_message(chat_id, u'Будь ласка, виберіть мову', reply_markup=markup)
+        msg = bot.send_message(chat_id, u'Не розпізнано', reply_markup=markup)
         bot.register_next_step_handler(msg, process_language)
         return
 
+    session = Session()
+    login = r_server.hget(chat_id, 'login')
+    user = session.query(UserMap).filter(UserMap.login == login).one()
     if message.text == u'🇺🇦 Українська':
         r_server.hset(chat_id, 'localization', 'UA')
+        user.lang = 'ua'
     else:
         r_server.hset(chat_id, 'localization', 'RU')
+        user.lang = 'ru'
+    session.commit()
+    session.close()
 
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
     r_server.hset(chat_id, 'shops_type', text[u'all_shops_sum'])
 
     # create new markup, types
@@ -202,16 +238,19 @@ def process_language(message):
 def process_type(message):
     start = time.time()
     chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     if check_message(message) is False:
         return
     if message.text not in text[u'types_values']:
         # create values for new markup
         markup = create_markup(text[u'types_values'])
-        msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
+        msg = bot.send_message(chat_id, text[u'not_recognized'], reply_markup=markup)
         bot.register_next_step_handler(msg, process_type)
         return
+
+    query = Query(chat_id)
+    query.set_cache_default()
 
     types_map = {
         text[u'types_values'][0]: 'turnover',
@@ -231,7 +270,12 @@ def process_type(message):
     r_server.hset(chat_id, 'page_shop', 0)
     r_server.hset(chat_id, 'page_category', 0)
 
-    result_text = text[u'choosen_type'] + u' ' + message.text + u'\n\n'
+    if message.text == text[u'types_values'][4]:
+        subtext = text[u'choosen']
+    else:
+        subtext = text[u'choosen_type']
+
+    result_text = subtext + u' ' + message.text + u'\n'
     result_text += text[u'main_menu']
 
     to_main_menu(message, result_text)
@@ -245,7 +289,7 @@ def process_main_menu(message):
         return
 
     chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
     query = Query(chat_id)
 
     if message.text == text[u'shops'] or message.text == text[u'next'] or message.text == text[u'prev']:
@@ -260,7 +304,7 @@ def process_main_menu(message):
         bot.register_next_step_handler(message, process_shop)
 
     elif message.text == text[u'main_menu_values'][1]:
-        categories = [text[u'all_categories']] + query.get_categories()
+        categories = query.get_categories()
 
         page = r_server.hget(chat_id, 'page_category')
         page = int(page)
@@ -301,9 +345,24 @@ def process_main_menu(message):
 
         query.set_info_cache()
         logging.info(query.show_query())
-        frame = query.make_query()
 
-        msg_text = create_message(chat_id, frame, query)
+        if query.shop == '-1':
+            frame = query.make_all_shops_query()
+            response_message = create_all_shops_message(frame, query)
+        else:
+            frame = query.make_query()
+            response_message = create_message(chat_id, frame, query)
+
+        if len(response_message) > 1:
+            for msg in response_message[:-1]:
+                bot.send_message(chat_id, msg)
+            bot.send_message(chat_id, response_message[-1], reply_markup=markup)
+        else:
+            bot.send_message(chat_id, response_message[0], reply_markup=markup)
+
+        if query.shop == '-1':
+            query.shop = 'all'
+            frame = query.make_query()
 
         vis_type = r_server.hget(chat_id, 'visualization').decode('utf-8', errors='replace')
         if frame is None:
@@ -311,17 +370,16 @@ def process_main_menu(message):
         if vis_type == text['visualization_values'][0]:
             create_visualization(query, frame, text['all_shops'], 'line')
             show_visualization(chat_id)
-        if vis_type == text['visualization_values'][1]:
+        elif vis_type == text['visualization_values'][1]:
             create_visualization(query, frame, text['all_shops'], 'bar')
             show_visualization(chat_id)
-        if vis_type == text['visualization_values'][2]:
+        elif vis_type == text['visualization_values'][2]:
             create_excel(query, frame)
             show_excel(chat_id)
 
-        msg = bot.send_message(chat_id, msg_text, reply_markup=markup)
-        bot.register_next_step_handler(msg, process_type)
+        bot.register_next_step_handler(message, process_type)
     else:
-        bot.send_message(chat_id, text[u'main_menu'])
+        bot.send_message(chat_id, text[u'not_recognized'])
         bot.register_next_step_handler(message, process_main_menu)
     save_state(chat_id)
     end = time.time() - start
@@ -334,7 +392,7 @@ def process_shop(message):
         return
 
     chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
     query = Query(chat_id)
 
     # pagination
@@ -357,15 +415,14 @@ def process_shop(message):
         r_server.hset(chat_id, 'shops_type', message.text)
 
         if message.text == text[u'all_shops'] or message.text == text[u'all_shops_sum']:
-            r_server.hset(str(message.chat.id), 'shop', 'all')
+            r_server.hset(str(message.chat.id), 'shop', '-1')
         else:
             r_server.hset(str(message.chat.id), 'shop', shops_info[message.text])
 
         shops_text = text[u'shops_choosen'] + u' ' + message.text + u'\n\n'
-        shops_text += text[u'main_menu']
         to_main_menu(message, shops_text)
     except KeyError:
-        bot.send_message(message.chat.id, text[u'shops_answer'])
+        bot.send_message(message.chat.id, text[u'not_recognized'])
         bot.register_next_step_handler(message, process_shop)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
@@ -377,7 +434,7 @@ def process_category(message):
         return
 
     chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
     query = Query(chat_id)
 
     # pagination
@@ -394,15 +451,23 @@ def process_category(message):
     try:
         # get category id
         if message.text != text[u'all_categories']:
-            r_server.hset(str(chat_id), 'category', query.dw.name2id([message.text]).values()[0])
+            category_dict = query.dw.name2id([message.text])
+
+            if not category_dict:
+                cat_query = message.text + u' '
+                category_dict = query.dw.name2id([cat_query])
+            if not category_dict:
+                cat_query = u' ' + message.text
+                category_dict = query.dw.name2id([cat_query])
+            r_server.hset(str(chat_id), 'category', category_dict.values()[0])
         else:
-            r_server.hset(str(chat_id), 'category', query.dw.get_client_info()['root_category'])
+            r_server.hset(str(chat_id), 'category', -1)
 
         category_text = text[u'category_choosen'] + u' ' + message.text + u'\n\n'
-        category_text += text[u'main_menu']
         to_main_menu(message, category_text)
-    except:
-        bot.send_message(chat_id, text[u'category_answer'])
+    except BaseException as e:
+        logging.error(str(chat_id) + ' category_process: ' + str(e))
+        bot.send_message(chat_id, text[u'not_recognized'])
         bot.register_next_step_handler(message, process_category)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
@@ -414,7 +479,7 @@ def process_period(message):
         return
 
     chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     try:
         if message.text == text[u'choose_period']:
@@ -426,10 +491,10 @@ def process_period(message):
             r_server.hset(chat_id, 'date_to', date_to)
 
             period_text = text[u'period_choosen_answer'] + u' ' + message.text + u'\n\n'
-            period_text += text[u'main_menu']
             to_main_menu(message, period_text)
-    except:
-        bot.send_message(chat_id, text[u'please_choose_period'])
+    except BaseException as e:
+        logging.error(str(e))
+        bot.send_message(chat_id, text[u'not_recognized'])
         bot.register_next_step_handler(message, process_period)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
@@ -441,18 +506,17 @@ def process_visualization(message):
         return
 
     chat_id = message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     if message.text not in text[u'visualization_values']:
         markup = create_markup(text[u'visualization_values'])
-        msg = bot.send_message(chat_id, text[u'visualization_answer'], reply_markup=markup)
+        msg = bot.send_message(chat_id, text[u'not_recognized'], reply_markup=markup)
         bot.register_next_step_handler(msg, process_visualization)
         return
 
     r_server.hset(chat_id, 'visualization', message.text)
 
-    vis_text = text[u'visualization_choosen_answer'] + u' ' + message.text + u'\n\n'
-    vis_text += text[u'main_menu']
+    vis_text = text[u'visualization_choosen_answer'] + u' ' + message.text.lower() + u'\n\n'
     to_main_menu(message, vis_text)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
@@ -466,14 +530,20 @@ def process_calendar(message):
     chat_id = message.chat.id
     query = Query(chat_id)
     now = query.dw.get_client_info()['date_to']
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     r_server.hset(chat_id, 'date_from', None)
     r_server.hset(chat_id, 'date_to', None)
 
     date = (now.year, now.month)
     current_shown_dates[chat_id] = date
-    markup = create_calendar(now.year,now.month)
+
+    # specific way to detect localization
+    if text[u'type'] == u'Показник':
+        markup = create_calendar(now.year,now.month, 'uk_UA.UTF-8')
+    else:
+        markup = create_calendar(now.year, now.month, 'ru_RU.UTF-8')
+
     bot.send_message(message.chat.id, text[u'please_choose_period'], reply_markup=markup)
     save_state(chat_id)
     end = time.time() - start
@@ -487,7 +557,7 @@ def to_main_menu(message, msg_text=None):
     if msg_text is None:
         msg_text = message.text
 
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     markup = create_markup(text[u'main_menu_values'])
     msg = bot.send_message(chat_id, msg_text, reply_markup=markup)
@@ -499,9 +569,9 @@ def to_main_menu(message, msg_text=None):
 
 def create_message(chat_id, frame, query):
     start = time.time()
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
     if frame is None:
-        return text['nothing_to_show']
+        return [text['nothing_to_show']]
 
     date_from = r_server.hget(str(chat_id), 'date_from')
     date_to = r_server.hget(str(chat_id), 'date_to')
@@ -509,17 +579,17 @@ def create_message(chat_id, frame, query):
     mask = "%Y-%m-%d %H:%M:%S"
     date_from = datetime.datetime.strptime(date_from, mask)
     date_to = datetime.datetime.strptime(date_to, mask)
+    date_str = date_from.date().strftime("%d-%m-%Y")
+    if date_from != date_to:
+        date_str += u' - ' + date_to.date().strftime("%d-%m-%Y")
 
-    message = text['period_nic'] + u': ' + str(date_from.date()) + u' - ' \
-              + str(date_to.date()) + u'\n'
-
-    if query.category != query.dw.get_client_info()['root_category']:
-        message += text['categories'] + u': ' + query.dw.id2name([query.category]).values()[0] + u'\n'
-    message += u'\n'
+    message = text[u'period_nic'] + u': ' + date_str
 
     # handle list or single element
-    df = frame.copy()
-    del df['date']
+    percent = frame[-1:]
+    df = frame[:-1].copy()
+
+    del df['date'], df['cat_name']
     sr = df.sum()
 
     shop = r_server.hget(chat_id, 'shop')
@@ -529,16 +599,76 @@ def create_message(chat_id, frame, query):
         shop = int(shop)
 
     # if handle list as single element (for total info)
-    if isinstance(shop, list) and len(shop) > 1:
+    message += u'\n'
+    if (isinstance(shop, list) and len(shop) > 1) or shop == -1:
         message += text[u'all_shops_sum'] + u'\n'
     else:
         message += query.id_shop2name(shop) + u'\n'
+
+    if int(query.category) != query.dw.get_client_info()[u'root_category']:
+        category_title = query.dw.id2name([query.category]).values()[0]
+        message += text[u'categories'] + u': ' + category_title + u'\n'
+
+    if len(sr.index) > 1:
+        index_order = ['turnover', 'qty', 'receipts_qty', 'profit']
+        sr = sr.reindex(index_order)
+
     for ind in sr.index.values:
-        message += query.type_translate(ind) + u' ' + str(sr[ind]) + u'\n'
+        message += query.type_translate(ind) + u': ' + str(sr[ind]) +\
+                   u'  (' + str(percent[ind].iloc[0].round(2)) + u'%)\n'
     message += u'\n'
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
-    return message
+    return [message]
+
+
+def create_all_shops_message(frame, query):
+    chat_id = query.chat_id
+
+    # get percent
+    percent = frame[(pd.isnull(frame.date) == True)]
+
+    frame = frame[(pd.isnull(frame.date) == False)]
+    frame = frame.groupby('shop_name').sum()
+    frame = frame.T
+    messages = []
+
+    if len(frame.index) > 1:
+        for col in frame:
+            message = u''
+            message += frame[col].name
+            specific_percent = percent[percent.shop_name == frame[col].name]
+            for ind in ['turnover', 'qty', 'receipts_qty', 'profit']:
+                message += u'\n' + query.type_translate(ind) + u': ' + str(frame.get_value(ind, col).round(2)) + \
+                           u' (' + str(specific_percent[ind].iloc[0].round(2)) + u'%)'
+            messages.append(message)
+    else:
+        message = u'' + query.type_translate(frame.index[0]) + u'\n'
+        for col in frame:
+            specific_percent = percent[percent.shop_name == frame[col].name]
+            message += frame[col].name + u': ' + str(frame[col][0].round(2)) + u' (' +\
+                       str(specific_percent[frame.index[0]].iloc[0].round(2)) + u'%)\n'
+
+        if len(message) > 4096:
+            message = message.split(u'\n')
+            for i in range(0, len(message), 90):
+                messages.append(u'\n'.join(message[i: i + 90]))
+        else:
+            messages.append(message)
+
+    # add data to first message
+    date_from = r_server.hget(str(chat_id), 'date_from')
+    date_to = r_server.hget(str(chat_id), 'date_to')
+
+    mask = "%Y-%m-%d %H:%M:%S"
+    date_from = datetime.datetime.strptime(date_from, mask)
+    date_to = datetime.datetime.strptime(date_to, mask)
+    date_str = date_from.date().strftime("%d-%m-%Y")
+    if date_from != date_to:
+        date_str += u' - ' + date_to.date().strftime("%d-%m-%Y")
+
+    messages[0] = date_str + u'\n' + messages[0]
+    return messages
 
 
 def create_visualization(query, frame, all_shops_text, vis_type='line'):
@@ -548,20 +678,51 @@ def create_visualization(query, frame, all_shops_text, vis_type='line'):
     if frame is None:
         return
 
-    if len(frame.name) > 1:
+    if query.shop == '-1':
+        del frame['shop_name']
+        frame = frame.groupby('date', as_index=False).sum()
         shop_name = all_shops_text
     else:
-        shop_name = frame.name[0]
+        del frame['cat_name']
+        if len(frame.name) > 1:
+            shop_name = all_shops_text
+        else:
+            shop_name = frame.name[0]
 
-    frame = frame.copy()
+    percent = frame[-1:]
+    frame = frame[:-1].copy()
+
+    if vis_type == 'bar':
+        date_from = r_server.hget(query.chat_id, 'date_from')
+        date_to = r_server.hget(query.chat_id, 'date_to')
+
+        mask = "%Y-%m-%d %H:%M:%S"
+        date_from = datetime.datetime.strptime(date_from, mask)
+        date_to = datetime.datetime.strptime(date_to, mask)
+
+        date_from = date_from.date()
+        date_to = date_to.date()
+
+        days_diff = (date_to - date_from).days
+
+        if days_diff > 180:
+            changed_df = frame['date'].apply(lambda x: x[:7])
+            frame['date'] = changed_df
+            frame = frame.groupby(['date']).sum()
+            frame.index = frame.index.map(lambda x: x[-2:] + u'-' + x[:4])
+        else:
+            frame = frame.set_index('date')
+            frame.index = frame.index.map(lambda x: x[-2:] + x[4:-2] + x[:4])
+    else:
+        frame = frame.set_index('date')
+        frame.index = frame.index.map(lambda x: x[-2:] + x[4:-2] + x[:4])
 
     # clear plots
     for col in frame.columns.values:
         plt.figure(col + str(query.chat_id),
-                            figsize=(16, 8),
+                            figsize=(16, 10),
                             dpi=160)
         plt.clf()
-    frame = frame.set_index('date')
     columns = frame.columns.values
 
     path = 'visualization/plots/'
@@ -576,26 +737,38 @@ def create_visualization(query, frame, all_shops_text, vis_type='line'):
         ax = figure.gca()
         ax.set_facecolor('#E8E8E8')
 
-        if isinstance(shop_name, int):
-            shop_name = query.id_shop2name(shop_name)
+        for spin in ax.spines.values():
+            spin.set_color('#B0B0B0')
 
-        plott = item.plot(label=shop_name, kind=vis_type)
-        plott.grid(which='major', axis='x', linewidth=0.75, linestyle='-', color='0.75')
-        plott.grid(which='minor', axis='x', linewidth=0.5, linestyle='-', color='0.75')
-        plott.grid(which='major', axis='y', linewidth=0.75, linestyle='-', color='0.75')
-        plott.grid(which='minor', axis='y', linewidth=0.5, linestyle='-', color='0.75')
-        plt.legend(loc='upper left', frameon=False)
+        plott = item.plot(label=query.type_translate(col), kind=vis_type)
+        plt.title(query.type_translate(col) + u': ' + str(frame[col].sum()) +
+                  u' (' + str(percent[col].iloc[0].round(2)) + u'%)')
+        plott.grid(which='major', axis='x', linewidth=0.25, linestyle='-', color='0.5')
+        plott.grid(which='minor', axis='x', linewidth=0.25, linestyle='-', color='0.5')
+        plott.grid(which='major', axis='y', linewidth=0.25, linestyle='-', color='0.5')
+        plott.grid(which='minor', axis='y', linewidth=0.25, linestyle='-', color='0.5')
+
+        legend = plt.legend(loc='upper right', frameon=True)
+        cut = legend.get_frame()
+        cut.set_facecolor('#E8E8E8')
+
         plt.savefig(path + col + str(query.chat_id) + extension)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
 
 
 def create_excel(query, frame):
+    if query.shop == '-1':
+        return
+
     start = time.time()
     text = get_text(query.chat_id)
     path = 'visualization/excel/'
+    login = r_server.hget(query.chat_id, 'login')
     extension = '.xlsx'
-    file_path = path + str(query.chat_id) + extension
+    file_path = path + login + str(query.chat_id) + extension
+
+    del frame['cat_name']
 
     if len(frame.name) > 1:
         shop_name = text[u'all_shops_sum']
@@ -603,7 +776,9 @@ def create_excel(query, frame):
         shop_name = frame.name[0]
         shop_name = query.id_shop2name(shop_name)
 
-    frame = frame.copy()
+    frame = frame[:-1].copy()
+    frame = frame.append(frame.sum(numeric_only=True), ignore_index=True)
+    frame.set_value(len(frame)-1, 'date', frame.iloc[0]['date'] + u' - ' + frame.iloc[len(frame)-2]['date'])
 
     rename_map = {'turnover': text['types_values'][0],
                 'qty': text['types_values'][1],
@@ -613,17 +788,22 @@ def create_excel(query, frame):
                 }
 
     frame = frame.rename(columns=rename_map)
+    frame = frame.rename({len(frame)-1: text['total']})
+
+    if isinstance(shop_name, int):
+        shop_name = str(shop_name)
 
     if os.path.exists(file_path) is True:
         book = load_workbook(file_path)
         writer = pd.ExcelWriter(file_path, engine='openpyxl')
         writer.book = book
         writer.sheets = dict((ws.title, ws) for ws in book.worksheets)
+        if shop_name in book.get_sheet_names():
+            ds = book.get_sheet_by_name(shop_name)
+            book.remove_sheet(ds)
+            del writer.sheets[shop_name]
     else:
         writer = pd.ExcelWriter(file_path, engine='openpyxl')
-
-    if isinstance(shop_name, int):
-        shop_name = str(shop_name)
 
     frame.to_excel(writer, shop_name)
     writer.save()
@@ -653,7 +833,8 @@ def show_visualization(chat_id):
 
 def show_excel(chat_id):
     start = time.time()
-    doc = open('visualization/excel/' + str(chat_id) + '.xlsx')
+    login = r_server.hget(chat_id, 'login')
+    doc = open('visualization/excel/' + login + str(chat_id) + '.xlsx')
     bot.send_document(chat_id, doc)
     end = time.time() - start
     time_storage[inspect.stack()[0][3]] = end
@@ -662,7 +843,7 @@ def show_excel(chat_id):
 @bot.callback_query_handler(func=lambda call: call.data == 'next-month')
 def next_month(call):
     chat_id = call.message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     saved_date = current_shown_dates.get(chat_id)
     if saved_date is not None:
@@ -673,7 +854,13 @@ def next_month(call):
             year+=1
         date = (year,month)
         current_shown_dates[chat_id] = date
-        markup= create_calendar(year,month)
+
+        # specific way to detect localization
+        if text[u'type'] == u'Показник':
+            markup = create_calendar(year, month, 'uk_UA.UTF-8')
+        else:
+            markup = create_calendar(year, month, 'ru_RU.UTF-8')
+
         bot.edit_message_text(text['please_choose_period'], call.from_user.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id, text="")
     else:
@@ -684,7 +871,7 @@ def next_month(call):
 @bot.callback_query_handler(func=lambda call: call.data == 'previous-month')
 def previous_month(call):
     chat_id = call.message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     saved_date = current_shown_dates.get(chat_id)
     if saved_date is not None:
@@ -695,7 +882,13 @@ def previous_month(call):
             year-=1
         date = (year,month)
         current_shown_dates[chat_id] = date
-        markup= create_calendar(year,month)
+
+        # specific way to detect localization
+        if text[u'type'] == u'Показник':
+            markup = create_calendar(year, month, 'uk_UA.UTF-8')
+        else:
+            markup = create_calendar(year, month, 'ru_RU.UTF-8')
+
         bot.edit_message_text(text['please_choose_period'], call.from_user.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id, text="")
     else:
@@ -706,7 +899,7 @@ def previous_month(call):
 def get_day(call):
     start = time.time()
     chat_id = call.message.chat.id
-    text = get_text(r_server.hget(chat_id, 'localization'))
+    text = get_text(chat_id)
 
     saved_date = current_shown_dates.get(chat_id)
     if saved_date is not None:
@@ -727,13 +920,15 @@ def get_day(call):
             if date_from > date_to:
                 date_to, date_from = date_from, date_to
 
-            date_to = str(date_to)
-            date_from = str(date_from)
+            date_to = date_to.date().strftime("%d-%m-%Y")
+            date_from = date_from.date().strftime("%d-%m-%Y")
+
+            date_str = date_from
+            if date_from != date_to:
+                date_str += u' - ' + str(date_to)
 
             r_server.hset(str(chat_id), 'date_to', date_choosen)
-            to_main_menu(call.message, text['choosen_period'] + u': '
-                         + date_from[:-8] + u' - '
-                         + date_to[:-8])
+            to_main_menu(call.message, text['choosen_period'] + u': ' + date_str)
         else:
             bot.send_message(chat_id, text['calendar_excep'])
         bot.answer_callback_query(call.id, text="")
@@ -799,4 +994,5 @@ def delete_state(chat_id):
 
 # clear_state()
 load_state()
+bot.remove_webhook()
 bot.polling(none_stop=True)

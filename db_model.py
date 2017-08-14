@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer
+from sqlalchemy import Column, String, Integer, Boolean
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
@@ -17,6 +17,8 @@ class UserMap(Base):
     chat_id = Column(Integer)
     login = Column(String)
     password = Column(String)
+    lang = Column(String)
+    sign_in = Column(Boolean)
 
     def __repr__(self):
         return self.login

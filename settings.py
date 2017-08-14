@@ -1,3 +1,7 @@
+import telebot
+import redis
+import flask
+
 TOKEN = '339108677:AAFwvvFhrbp-0__Zizc1Gi8Ongbh4v9SCFs'
 DB_CONNECTION = 'postgresql://telebot:qwerty@localhost/telebot'
 
@@ -10,3 +14,7 @@ WEBHOOK_SSL_PRIV = 'webhook_private.key'
 
 WEBHOOK_URL_BASE = "https://%s:%s" % (WEBHOOK_HOST, WEBHOOK_PORT)
 WEBHOOK_URL_PATH = "/%s/" % TOKEN
+
+bot = telebot.TeleBot(TOKEN)
+server = flask.Flask('localhost')
+r_server = redis.Redis('localhost')
