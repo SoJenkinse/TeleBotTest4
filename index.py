@@ -27,7 +27,6 @@ from openpyxl import load_workbook
 import pandas as pd
 
 current_shown_dates = {}
-time_storage = {}
 
 
 def sign_in(login, password, chat_id):

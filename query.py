@@ -14,8 +14,6 @@ import matplotlib
 import numpy as np
 matplotlib.use("agg")  # switch to png mode
 
-import time
-
 
 class Query:
     def __init__(self, chat_id):
