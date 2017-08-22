@@ -5,12 +5,11 @@ import sys
 import os
 import logging
 import datetime
-import time
-import pprint
+import re
 
 from settings import *
-from utils import get_text, create_markup, create_pagination_markup
-from db_model import UserMap, Session
+from utils import get_text, create_markup, create_linear_markup, create_pagination_markup
+from db_model import UserMap, UserState, UserAlert, Session
 from query import Query
 from dater import dater, create_calendar
 
@@ -18,10 +17,6 @@ from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
 from sqlalchemy.orm.exc import NoResultFound
 
 from dwapi import datawiz
-
-import telebot
-import flask
-import redis
 from telebot import types
 
 import matplotlib
@@ -31,13 +26,11 @@ import matplotlib.pyplot as plt
 from openpyxl import load_workbook
 import pandas as pd
 
-
 current_shown_dates = {}
 time_storage = {}
 
 
 def sign_in(login, password, chat_id):
-    start = time.time()
     session = Session()
 
     # sign out prev authentication if needed
@@ -57,20 +50,15 @@ def sign_in(login, password, chat_id):
         user = session.query(UserMap).filter(UserMap.login == login).one()
         user.sign_in = True
     except NoResultFound:
-        user = UserMap(chat_id = chat_id,
-                       login = login,
-                       password = password,
-                       sign_in = True)
+        user = UserMap(chat_id=chat_id,
+                       login=login,
+                       password=password,
+                       sign_in=True,
+                       timezone='UTC+2')
         session.add(user)
     finally:
         session.commit()
         session.close()
-
-        query = Query(chat_id, login)
-        query.set_cache_default(login)
-
-        end = time.time() - start
-        time_storage[inspect.stack()[0][3]] = end
     return True
 
 
@@ -80,13 +68,13 @@ def check_message(message):
                     message_text[:4] == u'вход' or \
                     message_text[:4] == u'вхід' or \
                     message_text == u'выход' or \
-                    message_text == u'вихід':
+                    message_text == u'вихід' or \
+                    message_text == '/settings':
         return False
     return True
 
 
 def sign_out(chat_id, text):
-    start = time.time()
     markup = types.ReplyKeyboardRemove()
 
     if text is None:
@@ -97,7 +85,7 @@ def sign_out(chat_id, text):
     try:
         # sign_in to False
         session = Session()
-        login = r_server.hget(chat_id, 'login')
+        login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
         user = session.query(UserMap).filter(UserMap.login == login).one()
         user.sign_in = False
         session.commit()
@@ -106,454 +94,829 @@ def sign_out(chat_id, text):
         # clear cache
         r_server.delete(chat_id)
         r_server.delete('category#' + str(chat_id))
-
     except NoResultFound:
         print('sign_out NoResultFound')
-
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
 
 
 @bot.message_handler(commands=['start'])
 def process_start(message):
-    start = time.time()
     chat_id = message.chat.id
-
     message_text = u'Доброго дня! \n'
     message_text += u'Я DWBot. Допоможу Вам знайти відповіді на питання по основних показниках вашого бізнесу. \n\n'
     message_text += u'Вхід <логін> <пароль> - команда для початку роботи \n\n'
     message_text += u'Наші контакти: \n'
     message_text += u'Тел: +38 (050) 337-73-53 \n'
     message_text += u'http://datawiz.io/uk/ \n'
-
     markup = types.ReplyKeyboardRemove()
     bot.send_message(chat_id, message_text, reply_markup=markup)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+
+
+@bot.message_handler(commands=['settings'])
+def process_settings(message):
+    try:
+        chat_id = message.chat.id
+
+        # check authentication
+        session = Session()
+        try:
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+
+            if user.sign_in is False:
+                raise Exception
+            session.close()
+        except:
+            session.close()
+            markup = types.ReplyKeyboardRemove()
+            bot.send_message(chat_id, u'Для доступу до налаштувань увійдіть в свій профіль', reply_markup=markup)
+            process_start(message)
+            return
+
+        text = get_text(chat_id)
+
+        values = text[u'settings_values']
+        markup = create_linear_markup(values)
+
+        if message.text == '/settings':
+            message_string = text[u'choose_parameter']
+        else:
+            message_string = message.text
+
+        bot.send_message(message.chat.id, message_string, reply_markup=markup)
+        bot.register_next_step_handler(message, process_settings_handler)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
+
+
+def process_settings_handler(message):
+    if check_message(message) is False:
+        return
+    try:
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+
+        session = Session()
+
+        alert_text = text[u'settings_values'][0]
+        timezone_text = text[u'settings_values'][1]
+        language_menu_text = text[u'settings_values'][2]
+        back_text = text[u'settings_values'][3]
+
+        add_query_submessage = text[u'add_alert_message'].split(' ')
+        add_query_submessage = u' '.join(add_query_submessage[:4])
+
+        delete_alert_text = text[u'delete_alert_message']
+
+        # get all alerts
+        if message.text == alert_text or add_query_submessage in message.text or message.text == delete_alert_text:
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+            values = user.alerts
+
+            type_map = {'turnover': text['types_values'][0],
+                        'qty': text['types_values'][1],
+                        'profit': text['types_values'][2],
+                        'receipts_qty': text['types_values'][3],
+                        'all': text['types_values'][4]
+                        }
+
+            alert_dates = text['alerts_date_values']
+
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            for i in range(0, len(values)):
+                markup.add(u'№' + str(i+1) + u', ' +
+                           alert_dates[values[i].alert_date].lower() + u', ' +
+                           str(values[i].alert_time)[:-3] + u', ' +
+                           type_map[values[i].query_type].lower())
+            markup.add(text[u'alerts_menu_values'][u'add'], text[u'alerts_menu_values'][u'done'])
+
+            if add_query_submessage in message.text or message.text == delete_alert_text:
+                bot.send_message(chat_id, message.text, reply_markup=markup)
+            else:
+                bot.send_message(chat_id, text[u'alert_choose_value'], reply_markup=markup)
+
+            bot.register_next_step_handler(message, process_settings_alert)
+
+        elif message.text == text[u'alerts_menu_second_values'][1]:
+            message.text = alert_text
+            process_settings_handler(message)
+
+        # add alert to database
+        elif message.text == u'query done':
+            # maps for localization independence
+            alert_dates_reverse = {value: key for key, value in text['alerts_date_values'].items()}
+            visualization_map = {
+                text['visualization_values'][0]: 'plot',
+                text['visualization_values'][1]: 'bar',
+                text['visualization_values'][2]: 'excel'
+            }
+
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+            query_type = r_server.hget(chat_id, 'type')
+            shop = r_server.hget(chat_id, 'shop')
+            category = r_server.hget(chat_id, 'category')
+            date_from = r_server.hget(chat_id, 'date_from')
+            date_to = r_server.hget(chat_id, 'date_to')
+
+            visualization = r_server.hget(chat_id, 'visualization').decode('utf-8', errors='replace')
+            if visualization != 'None':
+                visualization = visualization_map[visualization]
+
+            alert_date_string = r_server.hget(chat_id, 'alert_date').decode('utf-8', errors='replace')
+            alert_date = alert_dates_reverse[alert_date_string]
+            alert_time = r_server.hget(chat_id, 'alert_time')
+
+            # prepare data
+            mask = "%Y-%m-%d %H:%M:%S"
+            date_from = datetime.datetime.strptime(date_from, mask)
+            date_to = datetime.datetime.strptime(date_to, mask)
+            alert_time = datetime.datetime.strptime(alert_time, '%H:%M').time()
+
+            get_user_id = session.query(UserMap).filter(UserMap.login == login).one().id
+            alert = UserAlert(user_id = get_user_id,
+                              query_type=query_type,
+                              shop=shop,
+                              category=category,
+                              date_from=date_from,
+                              date_to=date_to,
+                              visualization=visualization,
+                              alert_date=alert_date,
+                              alert_time=alert_time)
+            session.add(alert)
+            session.commit()
+
+            query = Query(chat_id)
+            add_query_message = text[u'add_alert_message'].replace(u'{type}', query.type_translate(query_type))
+
+            if shop == 'all':
+                shop_string = text[u'all_shops']
+            elif shop == '-1':
+                shop_string = text[u'all_shops_sum']
+            else:
+                shop_string = query.id_shop2name(int(shop))
+
+            add_query_message = add_query_message.replace(u'{shop}', shop_string)
+
+            if int(category) != query.dw.get_client_info()['root_category']:
+                category_string = query.dw.id2name([int(category)]).values()[0] + u',\n'
+            else:
+                category_string = u''
+
+            add_query_message = add_query_message.replace(u'{category}, \n', category_string)
+
+            alert_dates = text['alerts_date_values']
+            alert_date_string = alert_dates[alert_date]
+
+            add_query_message = add_query_message.replace(u'{date}', alert_date_string)
+            add_query_message = add_query_message.replace(u'{time}', str(alert_time)[:-3])
+
+            message.text = add_query_message
+            process_settings_handler(message)
+
+        # delete alert
+        elif message.text == text[u'alerts_menu_second_values'][0]:
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+            alerts = user.alerts
+            alert_number = int(r_server.hget(chat_id, 'choosen_alert_num')) - 1
+            session.delete(alerts[alert_number])
+            session.commit()
+            message.text = delete_alert_text
+            process_settings_handler(message)
+
+        elif message.text == timezone_text:
+            markup = types.ReplyKeyboardMarkup()
+            markup.add('UTC+0')
+            for i in range(1, 13):
+                markup.add('UTC-' + str(i), 'UTC+' + str(i))
+
+            bot.send_message(chat_id, text[u'choose_UTC'], reply_markup=markup)
+            bot.register_next_step_handler(message, process_settings_timezone)
+
+        elif message.text == language_menu_text:
+            markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+
+            if user.lang == 'ua':
+                markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
+            else:
+                markup.add(u'🇷🇺 Русский', u'🇺🇦 Украинский')
+
+            bot.send_message(chat_id, text[u'choose_lang'], reply_markup=markup)
+            bot.register_next_step_handler(message, process_settings_language)
+
+        elif message.text == back_text:
+            # create new markup, types
+            markup = create_markup(text[u'types_values'])
+            msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
+            bot.register_next_step_handler(msg, process_type)
+        else:
+            print(message.text)
+            bot.send_message(chat_id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_settings_handler)
+
+        session.close()
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
+
+
+def process_settings_language(message):
+    if check_message(message) is False:
+        return
+    try:
+        chat_id = message.chat.id
+        session = Session()
+        login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+        user = session.query(UserMap).filter(UserMap.login == login).one()
+
+        if message.text == u'🇺🇦 Українська' or message.text == u'🇺🇦 Украинский':
+            lang = 'ua'
+        else:
+            lang = 'ru'
+
+        user.lang = lang
+        session.commit()
+        session.close()
+
+        if message.text == u'🇺🇦 Українська':
+            language_text = u'українську'
+        elif message.text == u'🇺🇦 Украинский':
+            language_text = u'українську'
+        elif message.text == u'🇷🇺 Російська':
+            language_text = u'русский'
+        elif message.text == u'🇷🇺 Русский':
+            language_text = u'русский'
+        else:
+            language_text = u''
+
+        text = get_text(chat_id)
+        message.text = text[u'language_changed'] + language_text
+        process_settings(message)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
+
+
+def process_settings_timezone(message):
+    if check_message(message) is False:
+        return
+    try:
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+
+        timezones = ['UTC+0']
+        for i in range(1, 13):
+            timezones += ['UTC-' + str(i), 'UTC+' + str(i)]
+
+        if message.text not in timezones:
+            bot.send_message(chat_id, text[u'not_recognized'])
+            message.text = text[u'settings_values'][1]
+            bot.register_next_step_handler(message, process_settings_timezone)
+            return
+
+        session = Session()
+        login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+        user = session.query(UserMap).filter(UserMap.login == login).one()
+        user.timezone = message.text
+        session.commit()
+        session.close()
+
+        message.text = text[u'UTC_changed'] + message.text
+        process_settings(message)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
+
+
+def process_settings_alert(message):
+    if check_message(message) is False:
+        return
+    try:
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+
+        if u'№' == message.text[0]:
+            number = re.match(u'\d+', message.text[1:]).group(0)
+            r_server.hset(chat_id, 'choosen_alert_num', number)
+            markup = create_markup(text[u'alerts_menu_second_values'], resize_keyboard=True)
+
+            session = Session()
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+            user = session.query(UserMap).filter(UserMap.login == login).one()
+            alerts = user.alerts
+            alert_number = int(r_server.hget(chat_id, 'choosen_alert_num')) - 1
+
+            for alert in alerts:
+                alert.is_active = False
+
+            alerts[alert_number].is_active = True
+            session.commit()
+            session.close()
+
+            # add alert number to string
+            response_text = text[u'choosen_alert']
+            response_text = response_text.split('*')
+            response_text = response_text[0] + str(number) + response_text[1]
+            bot.send_message(chat_id, response_text, reply_markup=markup)
+            bot.register_next_step_handler(message, process_settings_handler)
+        elif message.text == text[u'alerts_menu_values'][u'add']:
+            # change to settings mode
+            r_server.hset(chat_id, u'settings_mode', 1)
+
+            markup = create_markup(text[u'types_values'])
+            msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
+            bot.register_next_step_handler(msg, process_type)
+        elif message.text == text[u'alerts_menu_values'][u'done']:
+            process_settings(message)
+        else:
+            bot.send_message(chat_id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_settings_alert)
+
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
+
+
+def process_settings_date(message):
+    if check_message(message) is False:
+        return
+    try:
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+
+        if message.text not in text[u'alerts_date_values'].values():
+            bot.send_message(chat_id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_settings_date)
+            return
+
+        r_server.hset(chat_id, 'alert_date', message.text)
+
+        msg = bot.send_message(chat_id, text[u'choose_alert_time'])
+        bot.register_next_step_handler(msg, process_settings_time)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
+
+
+def process_settings_time(message):
+    if check_message(message) is False:
+        return
+    try:
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+
+        # check time
+        if re.match('\d\d:\d\d', message.text) is None \
+                or int(message.text[0]) > 2 \
+                or (int(message.text[0]) == 2 and int(message.text[1]) > 3) \
+                or int(message.text[3]) > 5:
+            msg = bot.send_message(chat_id, text[u'choose_alert_time'])
+            bot.register_next_step_handler(msg, process_settings_time)
+            return
+
+        r_server.hset(chat_id, 'alert_time', message.text)
+        message.text = u'query done'
+        process_settings_handler(message)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'settings')
 
 
 @bot.message_handler(func= lambda m: m.text[:4].lower() == u'вхід' or m.text[:4].lower() == u'вход')
 def process_login(message):
-    start = time.time()
-    chat_id = message.chat.id
+    try:
+        chat_id = message.chat.id
+        # authentication
+        raw_login_pass = message.text.split(' ')
+        if len(raw_login_pass) != 3:
+            bot.send_message(chat_id, u'Невірний формат вводу. Спробуйте ще раз')
+            return
 
-    # authentication
-    raw_login_pass = message.text.split(' ')
-    if len(raw_login_pass) != 3:
-        bot.send_message(chat_id, u'Невірний формат вводу. Спробуйте ще раз')
-        return
+        login = raw_login_pass[1]
+        password = raw_login_pass[2]
 
-    login = raw_login_pass[1]
-    password = raw_login_pass[2]
+        if not sign_in(login, password, chat_id):
+            bot.send_message(chat_id, u'Невірний логін чи пароль. Спробуйте ще раз')
+            return
 
-    if not sign_in(login, password, chat_id):
-        bot.send_message(chat_id, u'Невірний логін чи пароль. Спробуйте ще раз')
-        return
+        text = get_text(chat_id, login=login)
+        if text is not None:
+            # create new markup, types
+            markup = create_markup(text[u'types_values'])
+            msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
+            bot.register_next_step_handler(msg, process_type)
+        else:
+            # create values for new markup, languages
+            markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
 
-    text = get_text(chat_id)
-    if text is not None:
-        # create new markup, types
-        markup = create_markup(text[u'types_values'])
-        msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
-        bot.register_next_step_handler(msg, process_type)
-    else:
-        # create values for new markup
-        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
+            msg = bot.send_message(chat_id, u'Ласкаво просимо %s! Будь ласка, виберіть мову' % login, reply_markup=markup)
+            logging.info(u'ENTER ' + str(chat_id) + u' ' + login)
+            bot.register_next_step_handler(msg, process_language)
 
-        msg = bot.send_message(chat_id, u'Ласкаво просимо %s! Будь ласка, виберіть мову' % login, reply_markup=markup)
-        logging.info(u'ENTER ' + str(chat_id) + u' ' + login)
-        bot.register_next_step_handler(msg, process_language)
-
-    save_state(chat_id)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        save_state(chat_id, login=login)
+        query = Query(chat_id)
+        query.set_cache_default()
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'start')
 
 
 @bot.message_handler(func= lambda m: m.text.lower() == u'выход' or m.text.lower() == u'вихід')
 def process_exit(message):
-        start = time.time()
+    try:
         chat_id = message.chat.id
         text = get_text(chat_id)
         sign_out(chat_id, text)
         logging.info(u'EXIT ' + str(chat_id))
-        end = time.time() - start
-        time_storage[inspect.stack()[0][3]] = end
-
-
-@bot.message_handler(commands=['speed_test'])
-def speed_test(message):
-    chat_id = message.chat.id
-    global time_storage
-    print('SPEED RESULT')
-    for k in time_storage:
-        print(k, time_storage[k])
-
-    plt.clf()
-    plt.figure(figsize=(20,7), dpi=80)
-    plt.plot(range(len(time_storage)), time_storage.values(), '-', color='black')
-    plt.xticks(range(len(time_storage)), time_storage.keys(), rotation=90)
-    plt.savefig('time_measurement/' + str(chat_id) + '-' + str(datetime.datetime.now()) + '.png', )
-    time_storage = {}
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'start')
 
 
 def process_language(message):
-    start = time.time()
-    chat_id = message.chat.id
+    try:
+        chat_id = message.chat.id
 
-    if check_message(message) is False:
-        return
-    if message.text not in [u'🇷🇺 Російська', u'🇺🇦 Українська']:
-        # create values for new markup
-        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
-        msg = bot.send_message(chat_id, u'Не розпізнано', reply_markup=markup)
-        bot.register_next_step_handler(msg, process_language)
-        return
+        if check_message(message) is False:
+            return
+        if message.text not in [u'🇷🇺 Російська', u'🇺🇦 Українська']:
+            # create values for new markup
+            markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(u'🇷🇺 Російська', u'🇺🇦 Українська')
+            msg = bot.send_message(chat_id, u'Не розпізнано', reply_markup=markup)
+            bot.register_next_step_handler(msg, process_language)
+            return
 
-    session = Session()
-    login = r_server.hget(chat_id, 'login')
-    user = session.query(UserMap).filter(UserMap.login == login).one()
-    if message.text == u'🇺🇦 Українська':
-        r_server.hset(chat_id, 'localization', 'UA')
-        user.lang = 'ua'
-    else:
-        r_server.hset(chat_id, 'localization', 'RU')
-        user.lang = 'ru'
-    session.commit()
-    session.close()
+        session = Session()
+        login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+        user = session.query(UserMap).filter(UserMap.login == login).one()
+        if message.text == u'🇺🇦 Українська':
+            r_server.hset(chat_id, 'localization', 'UA')
+            user.lang = 'ua'
+        else:
+            r_server.hset(chat_id, 'localization', 'RU')
+            user.lang = 'ru'
+        session.commit()
+        session.close()
 
-    text = get_text(chat_id)
-    r_server.hset(chat_id, 'shops_type', text[u'all_shops_sum'])
+        text = get_text(chat_id)
+        r_server.hset(chat_id, 'shops_type', text[u'all_shops_sum'])
 
-    # create new markup, types
-    markup = create_markup(text[u'types_values'])
-    msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
-    bot.register_next_step_handler(msg, process_type)
-    save_state(chat_id)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        # create new markup, types
+        markup = create_markup(text[u'types_values'])
+        msg = bot.send_message(chat_id, text[u'choose_type:'], reply_markup=markup)
+        bot.register_next_step_handler(msg, process_type)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message, 'start')
 
 
 def process_type(message):
-    start = time.time()
-    chat_id = message.chat.id
-    text = get_text(chat_id)
+    try:
+        chat_id = message.chat.id
+        text = get_text(chat_id)
 
-    if check_message(message) is False:
-        return
-    if message.text not in text[u'types_values']:
-        # create values for new markup
-        markup = create_markup(text[u'types_values'])
-        msg = bot.send_message(chat_id, text[u'not_recognized'], reply_markup=markup)
-        bot.register_next_step_handler(msg, process_type)
-        return
+        if check_message(message) is False:
+            return
+        if message.text not in text[u'types_values']:
+            # create values for new markup
+            markup = create_markup(text[u'types_values'])
+            msg = bot.send_message(chat_id, text[u'not_recognized'], reply_markup=markup)
+            bot.register_next_step_handler(msg, process_type)
+            return
 
-    query = Query(chat_id)
-    query.set_cache_default()
+        query = Query(chat_id)
+        query.set_cache_default()
 
-    types_map = {
-        text[u'types_values'][0]: 'turnover',
-        text[u'types_values'][1]: 'qty',
-        text[u'types_values'][2]: 'profit',
-        text[u'types_values'][3]: 'receipts_qty'
-    }
-    # set list of types for query if it is main_factors
-    main_factors = text[u'types_values'][4]
+        types_map = {
+            text[u'types_values'][0]: 'turnover',
+            text[u'types_values'][1]: 'qty',
+            text[u'types_values'][2]: 'profit',
+            text[u'types_values'][3]: 'receipts_qty'
+        }
+        # set list of types for query if it is main_factors
+        main_factors = text[u'types_values'][4]
 
-    if message.text != main_factors:
-        r_server.hset(chat_id, 'type', types_map[message.text])
-    else:
-        r_server.hset(chat_id, 'type', 'all')
+        if message.text != main_factors:
+            r_server.hset(chat_id, 'type', types_map[message.text])
+        else:
+            r_server.hset(chat_id, 'type', 'all')
 
-    # reset pages
-    r_server.hset(chat_id, 'page_shop', 0)
-    r_server.hset(chat_id, 'page_category', 0)
+        # reset pages
+        r_server.hset(chat_id, 'page_shop', 0)
+        r_server.hset(chat_id, 'page_category', 0)
 
-    if message.text == text[u'types_values'][4]:
-        subtext = text[u'choosen']
-    else:
-        subtext = text[u'choosen_type']
+        if message.text == text[u'types_values'][4]:
+            subtext = text[u'choosen']
+        else:
+            subtext = text[u'choosen_type']
 
-    result_text = subtext + u' ' + message.text + u'\n'
-    result_text += text[u'main_menu']
+        result_text = subtext + u' ' + message.text + u'\n'
+        result_text += text[u'main_menu']
 
-    to_main_menu(message, result_text)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        to_main_menu(message, result_text)
+    except InvalidGrantError as e:
+        logging.error(str(e))
+        rollback_state(message, 'start')
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message)
 
 
 def process_main_menu(message):
-    start = time.time()
-    if check_message(message) is False:
-        return
+    try:
+        if check_message(message) is False:
+            return
 
-    chat_id = message.chat.id
-    text = get_text(chat_id)
-    query = Query(chat_id)
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+        query = Query(chat_id)
 
-    if message.text == text[u'shops'] or message.text == text[u'next'] or message.text == text[u'prev']:
-        shops = [text[u'all_shops_sum']]
-        shops += query.get_shops()
+        if message.text == text[u'shops'] or message.text == text[u'next'] or message.text == text[u'prev']:
+            shops = [text[u'all_shops_sum']]
+            shops += query.get_shops()
 
-        page = r_server.hget(chat_id, 'page_shop')
-        page = int(page)
+            page = r_server.hget(chat_id, 'page_shop')
+            page = int(page)
 
-        markup = create_pagination_markup(shops, text, page_number=page)
-        bot.send_message(message.chat.id, text[u'shops_answer'], reply_markup=markup)
-        bot.register_next_step_handler(message, process_shop)
+            markup = create_pagination_markup(shops, text, page_number=page)
+            bot.send_message(message.chat.id, text[u'shops_answer'], reply_markup=markup)
+            bot.register_next_step_handler(message, process_shop)
 
-    elif message.text == text[u'main_menu_values'][1]:
-        categories = query.get_categories()
+        elif message.text == text[u'main_menu_values'][1]:
+            categories = query.get_categories()
 
-        page = r_server.hget(chat_id, 'page_category')
-        page = int(page)
-        markup = create_pagination_markup(categories, text, page_number=page)
+            page = r_server.hget(chat_id, 'page_category')
+            page = int(page)
+            markup = create_pagination_markup(categories, text, page_number=page)
 
-        bot.send_message(chat_id, text[u'category_answer'], reply_markup=markup)
-        bot.register_next_step_handler(message, process_category)
+            bot.send_message(chat_id, text[u'category_answer'], reply_markup=markup)
+            bot.register_next_step_handler(message, process_category)
 
-    elif message.text == text[u'period']:
-        markup = create_markup(text[u'period_values'])
-        bot.send_message(chat_id, text[u'period_answer'], reply_markup=markup)
-        bot.register_next_step_handler(message, process_period)
+        elif message.text == text[u'period']:
+            markup = create_markup(text[u'period_values'])
+            bot.send_message(chat_id, text[u'period_answer'], reply_markup=markup)
+            bot.register_next_step_handler(message, process_period)
 
-    elif message.text == text[u'choose_period']:
-        process_calendar(message)
-        to_main_menu(message)
+        elif message.text == text[u'choose_period']:
+            process_calendar(message)
+            to_main_menu(message)
 
-    elif message.text == text[u'visualization']:
-        markup = create_markup(text[u'visualization_values'])
-        bot.send_message(chat_id, text[u'visualization_answer'], reply_markup=markup)
-        bot.register_next_step_handler(message, process_visualization)
+        elif message.text == text[u'visualization']:
+            markup = create_markup(text[u'visualization_values'])
+            bot.send_message(chat_id, text[u'visualization_answer'], reply_markup=markup)
+            bot.register_next_step_handler(message, process_visualization)
 
-    elif message.text == text[u'reset']:
-        query.set_cache_default()
+        elif message.text == text[u'reset']:
+            query.set_cache_default()
 
-        # to types markup
-        markup = create_markup(text[u'types_values'])
-        msg = bot.send_message(chat_id, text[u'reseted'], reply_markup=markup)
-        bot.register_next_step_handler(msg, process_type)
+            # to types markup
+            markup = create_markup(text[u'types_values'])
+            msg = bot.send_message(chat_id, text[u'reseted'], reply_markup=markup)
+            bot.register_next_step_handler(msg, process_type)
 
-    elif message.text == text[u'exit']:
-        markup = types.ReplyKeyboardRemove()
-        bot.send_message(chat_id, text[u'you_leave'], reply_markup=markup)
+        elif message.text == text[u'exit']:
+            markup = types.ReplyKeyboardRemove()
+            bot.send_message(chat_id, text[u'you_leave'], reply_markup=markup)
 
-    # query handler
-    elif message.text == text[u'OK']:
-        markup = create_markup(text[u'types_values'])
+        # query handler
+        elif message.text == text[u'OK']:
+            settings_mode = r_server.hget(chat_id, 'settings_mode')
+            if settings_mode == '1':
+                r_server.hset(chat_id, 'settings_mode', 0)
 
-        query.set_info_cache()
-        logging.info(query.show_query())
+                markup = create_markup(text[u'alerts_date_values'].values())
+                bot.send_message(chat_id, text[u'choose_alert_date'], reply_markup=markup)
+                bot.register_next_step_handler(message, process_settings_date)
+                return
 
-        if query.shop == '-1':
-            frame = query.make_all_shops_query()
-            response_message = create_all_shops_message(frame, query)
+            markup = create_markup(text[u'types_values'])
+            query.set_info_cache()
+            logging.info(query.show_query())
+
+            if query.shop == '-1':
+                frame = query.make_all_shops_query()
+                response_message = create_all_shops_message(frame, query)
+            else:
+                frame = query.make_query()
+                response_message = create_message(chat_id, frame, query)
+
+            if len(response_message) > 1:
+                for msg in response_message[:-1]:
+                    bot.send_message(chat_id, msg)
+                bot.send_message(chat_id, response_message[-1], reply_markup=markup)
+            else:
+                bot.send_message(chat_id, response_message[0], reply_markup=markup)
+
+            if query.shop == '-1':
+                query.shop = 'all'
+                frame = query.make_query()
+
+            vis_type = r_server.hget(chat_id, 'visualization').decode('utf-8', errors='replace')
+            if frame is None:
+                vis_type = None
+            if vis_type == text['visualization_values'][0]:
+                create_visualization(query, frame, 'line')
+                show_visualization(chat_id)
+            elif vis_type == text['visualization_values'][1]:
+                create_visualization(query, frame, 'bar')
+                show_visualization(chat_id)
+            elif vis_type == text['visualization_values'][2]:
+                create_excel(query, frame)
+                show_excel(chat_id)
+
+            bot.register_next_step_handler(message, process_type)
         else:
-            frame = query.make_query()
-            response_message = create_message(chat_id, frame, query)
-
-        if len(response_message) > 1:
-            for msg in response_message[:-1]:
-                bot.send_message(chat_id, msg)
-            bot.send_message(chat_id, response_message[-1], reply_markup=markup)
-        else:
-            bot.send_message(chat_id, response_message[0], reply_markup=markup)
-
-        if query.shop == '-1':
-            query.shop = 'all'
-            frame = query.make_query()
-
-        vis_type = r_server.hget(chat_id, 'visualization').decode('utf-8', errors='replace')
-        if frame is None:
-            vis_type = None
-        if vis_type == text['visualization_values'][0]:
-            create_visualization(query, frame, text['all_shops'], 'line')
-            show_visualization(chat_id)
-        elif vis_type == text['visualization_values'][1]:
-            create_visualization(query, frame, text['all_shops'], 'bar')
-            show_visualization(chat_id)
-        elif vis_type == text['visualization_values'][2]:
-            create_excel(query, frame)
-            show_excel(chat_id)
-
-        bot.register_next_step_handler(message, process_type)
-    else:
-        bot.send_message(chat_id, text[u'not_recognized'])
-        bot.register_next_step_handler(message, process_main_menu)
-    save_state(chat_id)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+            bot.send_message(chat_id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_main_menu)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message)
 
 
 def process_shop(message):
-    start = time.time()
-    if check_message(message) is False:
-        return
-
-    chat_id = message.chat.id
-    text = get_text(chat_id)
-    query = Query(chat_id)
-
-    # pagination
-    if message.text == text[u'next']:
-        r_server.hincrby(chat_id, 'page_shop', 1)
-        process_main_menu(message)
-        return
-
-    if message.text == text[u'prev']:
-        r_server.hincrby(chat_id, 'page_shop', -1)
-        process_main_menu(message)
-        return
-
-    # get shop id
-    # get dict of shops and inverse it for access by name
     try:
-        shops_info = query.dw.get_client_info()['shops']
-        shops_info = {value: key for key, value in shops_info.iteritems()}
+        if check_message(message) is False:
+            return
 
-        r_server.hset(chat_id, 'shops_type', message.text)
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+        query = Query(chat_id)
 
-        if message.text == text[u'all_shops'] or message.text == text[u'all_shops_sum']:
-            r_server.hset(str(message.chat.id), 'shop', '-1')
-        else:
-            r_server.hset(str(message.chat.id), 'shop', shops_info[message.text])
+        # pagination
+        if message.text == text[u'next']:
+            r_server.hincrby(chat_id, 'page_shop', 1)
+            process_main_menu(message)
+            return
 
-        shops_text = text[u'shops_choosen'] + u' ' + message.text + u'\n\n'
-        to_main_menu(message, shops_text)
-    except KeyError:
-        bot.send_message(message.chat.id, text[u'not_recognized'])
-        bot.register_next_step_handler(message, process_shop)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        if message.text == text[u'prev']:
+            r_server.hincrby(chat_id, 'page_shop', -1)
+            process_main_menu(message)
+            return
+
+        # get shop id
+        # get dict of shops and inverse it for access by name
+        try:
+            shops_info = query.dw.get_client_info()['shops']
+            shops_info = {value: key for key, value in shops_info.iteritems()}
+
+            r_server.hset(chat_id, 'shops_type', message.text)
+
+            if message.text == text[u'all_shops'] or message.text == text[u'all_shops_sum']:
+                r_server.hset(str(message.chat.id), 'shop', '-1')
+            else:
+                r_server.hset(str(message.chat.id), 'shop', shops_info[message.text])
+
+            shops_text = text[u'shops_choosen'] + u' ' + message.text + u'\n\n'
+            to_main_menu(message, shops_text)
+        except KeyError:
+            bot.send_message(message.chat.id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_shop)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message)
 
 
 def process_category(message):
-    start = time.time()
-    if check_message(message) is False:
-        return
-
-    chat_id = message.chat.id
-    text = get_text(chat_id)
-    query = Query(chat_id)
-
-    # pagination
-    if message.text == text[u'next']:
-        r_server.hincrby(chat_id, 'page_category', 1)
-        process_main_menu(message)
-        return
-
-    if message.text == text[u'prev']:
-        r_server.hincrby(chat_id, 'page_category', -1)
-        process_main_menu(message)
-        return
-
     try:
-        # get category id
-        if message.text != text[u'all_categories']:
-            category_dict = query.dw.name2id([message.text])
+        if check_message(message) is False:
+            return
 
-            if not category_dict:
-                cat_query = message.text + u' '
-                category_dict = query.dw.name2id([cat_query])
-            if not category_dict:
-                cat_query = u' ' + message.text
-                category_dict = query.dw.name2id([cat_query])
-            r_server.hset(str(chat_id), 'category', category_dict.values()[0])
-        else:
-            r_server.hset(str(chat_id), 'category', -1)
+        chat_id = message.chat.id
+        text = get_text(chat_id)
+        query = Query(chat_id)
 
-        category_text = text[u'category_choosen'] + u' ' + message.text + u'\n\n'
-        to_main_menu(message, category_text)
-    except BaseException as e:
-        logging.error(str(chat_id) + ' category_process: ' + str(e))
-        bot.send_message(chat_id, text[u'not_recognized'])
-        bot.register_next_step_handler(message, process_category)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        # pagination
+        if message.text == text[u'next']:
+            r_server.hincrby(chat_id, 'page_category', 1)
+            process_main_menu(message)
+            return
+
+        if message.text == text[u'prev']:
+            r_server.hincrby(chat_id, 'page_category', -1)
+            process_main_menu(message)
+            return
+
+        try:
+            # get category id
+            if message.text != text[u'all_categories']:
+                category_dict = query.dw.name2id([message.text])
+
+                if not category_dict:
+                    cat_query = message.text + u' '
+                    category_dict = query.dw.name2id([cat_query])
+                if not category_dict:
+                    cat_query = u' ' + message.text
+                    category_dict = query.dw.name2id([cat_query])
+                r_server.hset(str(chat_id), 'category', category_dict.values()[0])
+            else:
+                r_server.hset(str(chat_id), 'category', -1)
+
+            category_text = text[u'category_choosen'] + u' ' + message.text + u'\n\n'
+            to_main_menu(message, category_text)
+        except BaseException as e:
+            logging.error(str(chat_id) + ' category_process: ' + str(e))
+            bot.send_message(chat_id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_category)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message)
 
 
 def process_period(message):
-    start = time.time()
-    if message.text == '/start' or message.text[:4] == u'Вход':
-        return
-
-    chat_id = message.chat.id
-    text = get_text(chat_id)
-
     try:
-        if message.text == text[u'choose_period']:
-            process_calendar(message)
-        else:
-            date_from, date_to = dater(message.text, text, chat_id)
+        if check_message(message) is False:
+            return
 
-            r_server.hset(chat_id, 'date_from', date_from)
-            r_server.hset(chat_id, 'date_to', date_to)
+        chat_id = message.chat.id
+        text = get_text(chat_id)
 
-            period_text = text[u'period_choosen_answer'] + u' ' + message.text + u'\n\n'
-            to_main_menu(message, period_text)
-    except BaseException as e:
+        try:
+            if message.text == text[u'choose_period']:
+                process_calendar(message)
+            else:
+                date_from, date_to = dater(message.text, text, chat_id)
+
+                r_server.hset(chat_id, 'date_from', date_from)
+                r_server.hset(chat_id, 'date_to', date_to)
+
+                period_text = text[u'period_choosen_answer'] + u' ' + message.text + u'\n\n'
+                to_main_menu(message, period_text)
+        except BaseException as e:
+            logging.error(str(e))
+            bot.send_message(chat_id, text[u'not_recognized'])
+            bot.register_next_step_handler(message, process_period)
+    except Exception as e:
         logging.error(str(e))
-        bot.send_message(chat_id, text[u'not_recognized'])
-        bot.register_next_step_handler(message, process_period)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        rollback_state(message)
 
 
 def process_visualization(message):
-    start = time.time()
-    if check_message(message) is False:
-        return
+    try:
+        if check_message(message) is False:
+            return
 
-    chat_id = message.chat.id
-    text = get_text(chat_id)
+        chat_id = message.chat.id
+        text = get_text(chat_id)
 
-    if message.text not in text[u'visualization_values']:
-        markup = create_markup(text[u'visualization_values'])
-        msg = bot.send_message(chat_id, text[u'not_recognized'], reply_markup=markup)
-        bot.register_next_step_handler(msg, process_visualization)
-        return
+        if message.text not in text[u'visualization_values']:
+            markup = create_markup(text[u'visualization_values'])
+            msg = bot.send_message(chat_id, text[u'not_recognized'], reply_markup=markup)
+            bot.register_next_step_handler(msg, process_visualization)
+            return
 
-    r_server.hset(chat_id, 'visualization', message.text)
-
-    vis_text = text[u'visualization_choosen_answer'] + u' ' + message.text.lower() + u'\n\n'
-    to_main_menu(message, vis_text)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        r_server.hset(chat_id, 'visualization', message.text)
+        vis_text = text[u'visualization_choosen_answer'] + u' ' + message.text.lower() + u'\n\n'
+        to_main_menu(message, vis_text)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message)
 
 
 def process_calendar(message):
-    start = time.time()
-    if check_message(message) is False:
-        return
+    try:
+        if check_message(message) is False:
+            return
 
-    chat_id = message.chat.id
-    query = Query(chat_id)
-    now = query.dw.get_client_info()['date_to']
-    text = get_text(chat_id)
+        chat_id = message.chat.id
+        query = Query(chat_id)
+        now = query.dw.get_client_info()['date_to']
+        text = get_text(chat_id)
 
-    r_server.hset(chat_id, 'date_from', None)
-    r_server.hset(chat_id, 'date_to', None)
+        r_server.hset(chat_id, 'date_from', None)
+        r_server.hset(chat_id, 'date_to', None)
 
-    date = (now.year, now.month)
-    current_shown_dates[chat_id] = date
+        date = (now.year, now.month)
+        current_shown_dates[chat_id] = date
 
-    # specific way to detect localization
-    if text[u'type'] == u'Показник':
-        markup = create_calendar(now.year,now.month, 'uk_UA.UTF-8')
-    else:
-        markup = create_calendar(now.year, now.month, 'ru_RU.UTF-8')
+        # specific way to detect localization
+        if text[u'type'] == u'Показник':
+            markup = create_calendar(now.year,now.month, 'uk_UA.UTF-8')
+        else:
+            markup = create_calendar(now.year, now.month, 'ru_RU.UTF-8')
 
-    bot.send_message(message.chat.id, text[u'please_choose_period'], reply_markup=markup)
-    save_state(chat_id)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        bot.send_message(message.chat.id, text[u'please_choose_period'], reply_markup=markup)
+        save_state(chat_id)
+    except Exception as e:
+        logging.error(str(e))
+        rollback_state(message)
 
 
 def to_main_menu(message, msg_text=None):
-    start = time.time()
     chat_id = message.chat.id
-
     if msg_text is None:
         msg_text = message.text
 
@@ -563,12 +926,19 @@ def to_main_menu(message, msg_text=None):
     msg = bot.send_message(chat_id, msg_text, reply_markup=markup)
     bot.register_next_step_handler(msg, process_main_menu)
     save_state(chat_id)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+
+
+def to_types_menu(message):
+    chat_id = message.chat.id
+    text = get_text(chat_id)
+    msg_text = message.text
+    markup = create_markup(text[u'types_values'])
+    msg = bot.send_message(chat_id, msg_text, reply_markup=markup)
+    bot.register_next_step_handler(msg, process_type)
+    save_state(chat_id)
 
 
 def create_message(chat_id, frame, query):
-    start = time.time()
     text = get_text(chat_id)
     if frame is None:
         return [text['nothing_to_show']]
@@ -585,11 +955,11 @@ def create_message(chat_id, frame, query):
 
     message = text[u'period_nic'] + u': ' + date_str
 
-    # handle list or single element
+    # get percent info from frame
     percent = frame[-1:]
     df = frame[:-1].copy()
-
-    del df['date'], df['cat_name']
+    if 'date' in df.columns:
+        del df['date']
     sr = df.sum()
 
     shop = r_server.hget(chat_id, 'shop')
@@ -617,19 +987,24 @@ def create_message(chat_id, frame, query):
         message += query.type_translate(ind) + u': ' + str(sr[ind]) +\
                    u'  (' + str(percent[ind].iloc[0].round(2)) + u'%)\n'
     message += u'\n'
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
     return [message]
 
 
 def create_all_shops_message(frame, query):
     chat_id = query.chat_id
+    text = get_text(chat_id)
+
+    if frame is None:
+        return [text['nothing_to_show']]
 
     # get percent
-    percent = frame[(pd.isnull(frame.date) == True)]
-
-    frame = frame[(pd.isnull(frame.date) == False)]
+    percent = frame.loc[frame.index == 'percent']
+    frame = frame.drop('percent')
     frame = frame.groupby('shop_name').sum()
+
+    if 'name' in frame.columns:
+        del frame['name']
+
     frame = frame.T
     messages = []
 
@@ -663,16 +1038,22 @@ def create_all_shops_message(frame, query):
     mask = "%Y-%m-%d %H:%M:%S"
     date_from = datetime.datetime.strptime(date_from, mask)
     date_to = datetime.datetime.strptime(date_to, mask)
-    date_str = date_from.date().strftime("%d-%m-%Y")
+    date_str = text['period_nic'] + ': '
+    date_str += date_from.date().strftime("%d-%m-%Y")
     if date_from != date_to:
         date_str += u' - ' + date_to.date().strftime("%d-%m-%Y")
 
-    messages[0] = date_str + u'\n' + messages[0]
+    if int(query.category) != query.dw.get_client_info()[u'root_category']:
+        category_title = query.dw.id2name([query.category]).values()[0]
+        category_str = text['categories'] + ': ' + category_title + u'\n'
+    else:
+        category_str = u''
+
+    messages[0] = date_str + u'\n' + category_str + messages[0]
     return messages
 
 
-def create_visualization(query, frame, all_shops_text, vis_type='line'):
-    start = time.time()
+def create_visualization(query, frame, vis_type='line'):
     if vis_type is None:
         return
     if frame is None:
@@ -681,13 +1062,6 @@ def create_visualization(query, frame, all_shops_text, vis_type='line'):
     if query.shop == '-1':
         del frame['shop_name']
         frame = frame.groupby('date', as_index=False).sum()
-        shop_name = all_shops_text
-    else:
-        del frame['cat_name']
-        if len(frame.name) > 1:
-            shop_name = all_shops_text
-        else:
-            shop_name = frame.name[0]
 
     percent = frame[-1:]
     frame = frame[:-1].copy()
@@ -753,22 +1127,20 @@ def create_visualization(query, frame, all_shops_text, vis_type='line'):
         cut.set_facecolor('#E8E8E8')
 
         plt.savefig(path + col + str(query.chat_id) + extension)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
 
 
 def create_excel(query, frame):
     if query.shop == '-1':
         return
-
-    start = time.time()
     text = get_text(query.chat_id)
     path = 'visualization/excel/'
-    login = r_server.hget(query.chat_id, 'login')
+
+    session = Session()
+    login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+    session.close()
+
     extension = '.xlsx'
     file_path = path + login + str(query.chat_id) + extension
-
-    del frame['cat_name']
 
     if len(frame.name) > 1:
         shop_name = text[u'all_shops_sum']
@@ -807,14 +1179,10 @@ def create_excel(query, frame):
 
     frame.to_excel(writer, shop_name)
     writer.save()
-
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
     return
 
 
 def show_visualization(chat_id):
-    start = time.time()
     type_plot = r_server.hget(chat_id, 'type')
     extension = '.png'
 
@@ -827,17 +1195,15 @@ def show_visualization(chat_id):
             path = 'visualization/plots/' + tp + str(chat_id) + extension
             image = open(path, 'rb')
             bot.send_photo(chat_id, image)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
 
 
 def show_excel(chat_id):
-    start = time.time()
-    login = r_server.hget(chat_id, 'login')
+    session = Session()
+    login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+    session.close()
+
     doc = open('visualization/excel/' + login + str(chat_id) + '.xlsx')
     bot.send_document(chat_id, doc)
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
 
 
 @bot.callback_query_handler(func=lambda call: call.data == 'next-month')
@@ -897,7 +1263,6 @@ def previous_month(call):
 
 @bot.callback_query_handler(func=lambda call: call.data[0:13] == 'calendar-day-')
 def get_day(call):
-    start = time.time()
     chat_id = call.message.chat.id
     text = get_text(chat_id)
 
@@ -919,6 +1284,8 @@ def get_day(call):
 
             if date_from > date_to:
                 date_to, date_from = date_from, date_to
+                date_choosen = date_to
+                r_server.hset(str(chat_id), 'date_from', date_from)
 
             date_to = date_to.date().strftime("%d-%m-%Y")
             date_from = date_from.date().strftime("%d-%m-%Y")
@@ -934,22 +1301,24 @@ def get_day(call):
         bot.answer_callback_query(call.id, text="")
     else:
         pass
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
 
 
 def load_state():
-    start = time.time()
     # get all process functions in module and create dict {string_func, func}
     fset = [obj for name, obj in inspect.getmembers(sys.modules[__name__]) if inspect.isfunction(obj)]
     fset = [obj for obj in fset if 'process' in str(obj)]
     fset_string = [str(obj).split()[1] for obj in fset]
     fdict = {key: value for key, value in zip(fset_string, fset)}
 
-    if r_server.exists('pre_message_subscribers_next_step'):
-        pre_message_sub = r_server.hgetall('pre_message_subscribers_next_step')
-    else:
+    # create dict from bd values
+    session = Session()
+    try:
+        states = session.query(UserState).all()
+        pre_message_sub = {str(obj.chat_id): obj.state_fun for obj in states}
+    except NoResultFound:
         pre_message_sub = {}
+    finally:
+        session.close()
 
     # handle pre_message_sub, transform strings to correct values
     for key in pre_message_sub:
@@ -959,40 +1328,73 @@ def load_state():
             func_string = func_string.split(' ')[1]
             pre_message_sub[int(key)] = [fdict[func_string]]
     bot.pre_message_subscribers_next_step = pre_message_sub
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
 
 
-def save_state(chat_id):
-    start = time.time()
+def save_state(chat_id, login=None):
     try:
         value = bot.pre_message_subscribers_next_step[chat_id]
 
-# only one function can be located in pre_message_subscribers_next_step
+        # only one function can be located in pre_message_subscribers_next_step
         if len(value) > 1:
             value = value[0]
             bot.pre_message_subscribers_next_step[chat_id] = [value]
 
-        r_server.hset('pre_message_subscribers_next_step', chat_id, value)
-    except KeyError:
-        logging.error('Key Error')
-    end = time.time() - start
-    time_storage[inspect.stack()[0][3]] = end
+        value = str(value)
+        session = Session()
+        try:
+            state = session.query(UserState).filter(UserState.chat_id == chat_id).one()
+            state.state_fun = value
+
+            if login is not None:
+                state.login = login
+
+        except NoResultFound:
+            if login is not None:
+                state = UserState(chat_id=chat_id,
+                                  state_fun=value,
+                                  login=login)
+            else:
+                state = UserState(chat_id=chat_id,
+                                  state_fun=value)
+            session.add(state)
+        finally:
+            session.commit()
+            session.close()
+    except KeyError as e:
+        logging.error('Key Error, state not saved')
+    except Exception as e:
+        logging.error(str(e))
+
+
+def rollback_state(message, rollback_func=None):
+    clear_state(message.chat.id)
+    if rollback_func == 'start':
+        process_start(message)
+    elif rollback_func == 'settings':
+        process_settings(message)
+    else:
+        to_types_menu(message)
 
 
 def show_state(text):
     logging.info(text, bot.pre_message_subscribers_next_step)
 
 
-def clear_state():
-    bot.pre_message_subscribers_next_step = {}
-    r_server.delete('pre_message_subscribers_next_step')
-
-
-def delete_state(chat_id):
+def clear_state(chat_id):
     bot.pre_message_subscribers_next_step[chat_id] = []
 
-# clear_state()
+
+def clear_states():
+    try:
+        bot.pre_message_subscribers_next_step = {}
+        session = Session()
+        session.query(UserState).delete()
+        session.commit()
+        session.close()
+    except Exception as e:
+        logging.error('clear_states ' + str(e))
+
+# clear_states()
 load_state()
-bot.remove_webhook()
+# bot.remove_webhook()
 bot.polling(none_stop=True)

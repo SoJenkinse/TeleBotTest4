@@ -1,28 +1,27 @@
 # -*- coding: utf-8 -*-
 
 from datetime import datetime, timedelta
-from db_model import UserMap, Session
+from db_model import UserMap, UserState, Session
 from utils import get_text
 import logging
 import pandas as pd
 from settings import r_server
 
-import redis
 from dwapi import datawiz
 from sqlalchemy.orm.exc import NoResultFound
 
 import matplotlib
+import numpy as np
 matplotlib.use("agg")  # switch to png mode
 
 import time
 
-class Query:
-    def __init__(self, chat_id, login=None):
-        try:
-            if login is None:
-                login = r_server.hget(chat_id, 'login')
 
+class Query:
+    def __init__(self, chat_id):
+        try:
             session = Session()
+            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
             user = session.query(UserMap).filter(UserMap.login == login).one()
             session.close()
 
@@ -44,15 +43,12 @@ class Query:
         self.date_from = date_from
         self.date_to = date_to
 
-    def set_cache_default(self, login=None):
+    def set_cache_default(self):
         self.query_type = 'all'
         self.shop = 'all'
         self.category = self.dw.get_client_info()['root_category']
         self.date_to = self.dw.get_client_info()['date_to']
         self.date_from = self.date_to - timedelta(29)
-
-        if login is not None:
-            r_server.hset(self.chat_id, 'login', login)
 
         r_server.hset(self.chat_id, 'shop', 'all')
         r_server.hset(self.chat_id, 'category', self.category)
@@ -101,28 +97,27 @@ class Query:
         if frame.empty is True:
             return None
 
-        # create percent of difference
-        date_from_diff = date_from - (date_to - date_from) - timedelta(1)
-        date_to_diff = date_from - timedelta(1)
-        prev_frame = self.dw.get_categories_sale(by=query_type,
-                                           shops=shop,
-                                           date_from=date_from_diff,
-                                           date_to=date_to_diff,
-                                           categories=category,
-                                           view_type='raw'
-                                           )
+        check_frame = frame.sum()
+        if isinstance(query_type, list):
+            check_type = query_type[0]
+        else:
+            check_type = query_type
 
-        current_frame = frame.copy().sum()
-        prev_frame = prev_frame.sum()
+        if check_frame[check_type] == 0 or check_frame[check_type] == np.nan:
+            return None
 
-        del prev_frame['category'], prev_frame['date'], prev_frame['name']
-        del current_frame['category'], current_frame['date'], current_frame['name']
+        frame = self.make_percent_query(frame, date_from, date_to, query_type, shop, category, 'one')
 
-        result_diff_frame = (current_frame / prev_frame)*100 - 100
-        frame = frame.rename(columns={'name':'cat_name'})
-        frame = frame.append(result_diff_frame, ignore_index=True)
-        del frame['category']
-        frame.name = shop
+        if 'name' in frame.columns:
+            del frame['name']
+        if 'category' in frame.columns:
+            del frame['category']
+
+        if isinstance(shop, list):
+            shop_name = 'all_shops'
+        else:
+            shop_name = shop
+        frame.name = shop_name
         return frame
 
     def make_all_shops_query(self):
@@ -147,34 +142,62 @@ class Query:
                                            view_type='raw'
                                            )
             if frame.empty is False:
-                # create percent of difference
-                date_from_diff = date_from - (date_to - date_from) - timedelta(1)
-                date_to_diff = date_from - timedelta(1)
+                check_frame = frame.sum()
+                if isinstance(query_type, list):
+                    check_type = query_type[0]
+                else:
+                    check_type = query_type
 
-                prev_frame = self.dw.get_categories_sale(by=query_type,
-                                                         shops=shop,
-                                                         date_from=date_from_diff,
-                                                         date_to=date_to_diff,
-                                                         categories=category,
-                                                         view_type='raw'
-                                                         )
+                if check_frame[check_type] == 0 or check_frame[check_type] == np.nan:
+                    continue
 
-                current_frame = frame.copy().sum()
-                prev_frame = prev_frame.sum()
-
-                del current_frame['category'], current_frame['date'], current_frame['name']
-                del prev_frame['category'], prev_frame['date'], prev_frame['name']
-
-                result_diff_frame = (current_frame / prev_frame) * 100 - 100
-                frame = frame.groupby('date', as_index=False).sum()
-                frame = frame.append(result_diff_frame, ignore_index=True)
-
+                frame = self.make_percent_query(frame, date_from, date_to, query_type, shop, category, 'all')
                 del frame['category']
                 frame['shop_name'] = self.id_shop2name(shop)
                 frames.append(frame)
 
+        if len(frames) == 0:
+            return None
+
         mainframe = pd.concat(frames)
         return mainframe
+
+    def make_percent_query(self, frame, date_from, date_to, query_type, shop, category, shops_count='one'):
+
+        frame = frame.copy()
+        date_from_diff = date_from - (date_to - date_from) - timedelta(1)
+        date_to_diff = date_from - timedelta(1)
+        prev_frame = self.dw.get_categories_sale(by=query_type,
+                                           shops=shop,
+                                           date_from=date_from_diff,
+                                           date_to=date_to_diff,
+                                           categories=category,
+                                           view_type='raw'
+                                           )
+        current_frame = frame.copy().sum()
+        prev_frame = prev_frame.sum()
+
+        if prev_frame.empty is True:
+            result_diff_frame = current_frame.copy()
+            result_diff_frame[:] = 0.0
+        else:
+            del prev_frame['category'], prev_frame['date'], prev_frame['name']
+            del current_frame['category'], current_frame['date'], current_frame['name']
+
+            try:
+                result_diff_frame = (current_frame / prev_frame)*100 - 100
+            except ValueError as e:
+                print(str(e))
+                result_diff_frame = current_frame.copy()
+                result_diff_frame[:] = 0.0
+
+        if shops_count == 'one':
+            frame = frame.append(result_diff_frame, ignore_index=True)
+        else:
+            frame = frame.groupby('date', as_index=False).sum()
+            frame = frame.append(result_diff_frame, ignore_index=True)
+        frame = frame.rename({frame.index[-1]: 'percent'})
+        return frame
 
     def get_shops(self):
         return sorted(self.dw.get_client_info()['shops'].values())
@@ -214,7 +237,8 @@ class Query:
         type_map = {'turnover': text['types_values'][0],
                     'qty': text['types_values'][1],
                     'profit': text['types_values'][2],
-                    'receipts_qty': text['types_values'][3]
+                    'receipts_qty': text['types_values'][3],
+                    'all': text['types_values'][4]
                     }
         return type_map[type_string]
 

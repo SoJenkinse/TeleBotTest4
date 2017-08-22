@@ -1,18 +1,21 @@
-from settings import r_server
+# -*- coding: utf-8 -*-
 
 from telebot import types
 import json
-from db_model import Session, UserMap
+from db_model import Session, UserMap, UserState
 from sqlalchemy.orm.exc import NoResultFound
 
 time_test = {}
 
 
-def get_text(chat_id, language = 'ua', force = False):
+def get_text(chat_id, language = 'ua', force = False, login=None):
     if force is False:
         try:
             session = Session()
-            login = r_server.hget(chat_id, 'login')
+
+            if login is None:
+                login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+
             user = session.query(UserMap).filter(UserMap.login == login).one()
             language = user.lang
             session.close()
@@ -32,8 +35,8 @@ def get_text(chat_id, language = 'ua', force = False):
 
 
 # create markup from list
-def create_markup(values):
-    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True)
+def create_markup(values, resize_keyboard=False):
+    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=resize_keyboard)
     for i in range(0, len(values), 2):
         if len(values) % 2 != 0 and i == len(values)-1:
             markup.add(values[i])
@@ -42,9 +45,15 @@ def create_markup(values):
     return markup
 
 
+def create_linear_markup(values):
+    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True)
+    for value in values:
+        markup.add(value)
+    return markup
+
+
 def create_pagination_markup(values, text, chunk_len=50, page_number=0):
     markup = types.ReplyKeyboardMarkup(one_time_keyboard=True)
-
     values[1:] = sorted(values[1:])
 
     if len(values) > chunk_len:

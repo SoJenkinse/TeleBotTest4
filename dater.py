@@ -74,7 +74,6 @@ def dater(income_text, text, chat_id):
         return info['date_from'], info['date_to']
 
 
-
 def create_calendar(year,month, locale):
     markup = types.InlineKeyboardMarkup()
     #First row - Month and Year
