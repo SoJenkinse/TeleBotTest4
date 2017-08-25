@@ -4,6 +4,7 @@ from telebot import types
 import json
 from db_model import Session, UserMap, UserState
 from sqlalchemy.orm.exc import NoResultFound
+import logging
 
 time_test = {}
 
@@ -20,7 +21,7 @@ def get_text(chat_id, language = 'ua', force = False, login=None):
             language = user.lang
             session.close()
         except NoResultFound:
-            print('get_text NoResultFound')
+            logging.error('get_text NoResultFound')
 
         if language is None:
             return None
