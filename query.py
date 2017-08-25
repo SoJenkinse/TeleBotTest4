@@ -163,8 +163,8 @@ class Query:
     def make_percent_query(self, frame, date_from, date_to, query_type, shop, category, shops_count='one'):
 
         frame = frame.copy()
-        date_from_diff = date_from - (date_to - date_from) - timedelta(1)
         date_to_diff = date_from - timedelta(1)
+        date_from_diff = date_to_diff - timedelta(days=(date_to - date_from).days)
         prev_frame = self.dw.get_categories_sale(by=query_type,
                                            shops=shop,
                                            date_from=date_from_diff,

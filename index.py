@@ -496,7 +496,7 @@ def process_login(message):
     try:
         chat_id = message.chat.id
         # authentication
-        raw_login_pass = message.text.split(' ')
+        raw_login_pass = message.text.split()
         if len(raw_login_pass) != 3:
             bot.send_message(chat_id, u'Невірний формат вводу. Спробуйте ще раз')
             return
@@ -1135,7 +1135,7 @@ def create_excel(query, frame):
     path = 'visualization/excel/'
 
     session = Session()
-    login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
+    login = session.query(UserState).filter(UserState.chat_id == query.chat_id).one().login
     session.close()
 
     extension = '.xlsx'
