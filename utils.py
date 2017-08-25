@@ -6,10 +6,8 @@ from db_model import Session, UserMap, UserState
 from sqlalchemy.orm.exc import NoResultFound
 import logging
 
-time_test = {}
 
-
-def get_text(chat_id, language = 'ua', force = False, login=None):
+def get_text(chat_id, language='ua', force=False, login=None):
     if force is False:
         try:
             session = Session()
