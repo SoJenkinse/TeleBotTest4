@@ -9,11 +9,7 @@ from telebot import types
 import calendar
 from calendar import TimeEncoding, month_name
 from query import Query
-
-
-def last_day_of_month(any_day):
-    next_month = any_day.replace(day=28) + datetime.timedelta(days=4)
-    return next_month - datetime.timedelta(days=next_month.day)
+from utils import month_end
 
 
 def month_name_locale(month_no, locale):
@@ -23,7 +19,6 @@ def month_name_locale(month_no, locale):
                    'Вересень', 'Жовтень', 'Листопад', 'Грудень']
         s = l_month[month_no - 1]
         return s
-    # for ukrainian
     with TimeEncoding(locale) as encoding:
         s = month_name[month_no]
         if encoding is not None:
@@ -66,7 +61,7 @@ def dater(income_text, text, chat_id):
         return datetime.datetime(year, month, day), today
     if income_text == text['period_values'][5]:
         from_month_begin = today.replace(day=1, month=today.month-1)
-        return from_month_begin, last_day_of_month(from_month_begin)
+        return from_month_begin, month_end(from_month_begin)
     if income_text == text['period_values'][6]:
         return today.replace(day=1), today
     if income_text == text['period_values'][7]:

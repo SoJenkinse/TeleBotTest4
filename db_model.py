@@ -18,11 +18,9 @@ class UserMap(Base):
     __tablename__ = 'users'
 
     id = Column(Integer, primary_key=True)
-    chat_id = Column(Integer)
     login = Column(String)
     password = Column(String)
     lang = Column(String)
-    sign_in = Column(Boolean)
     timezone = Column(String)
 
     def __repr__(self):
@@ -36,8 +34,11 @@ class UserState(Base):
     __tablename__ = 'state'
 
     chat_id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     state_fun = Column(String)
-    login = Column(String)
+    sign_in = Column(Boolean)
+
+    user = relationship("UserMap", back_populates="states")
 
     def __str__(self):
         return str(self.chat_id) + self.state
@@ -64,22 +65,7 @@ class UserAlert(Base):
         return str(self.chat_id) + ' ' + self.login + ' ' + self.query_type
 
 UserMap.alerts = relationship("UserAlert", order_by=UserAlert.id, back_populates="user")
+UserMap.states = relationship("UserState", order_by=UserState.chat_id, back_populates="user")
 
 if __name__ == '__main__':
     Base.metadata.create_all(engine)
-    # session = Session()
-    # test_user = UserMap(login='test',
-    #                    password='qwerty',
-    #                    chat_id=2)
-    # test_state = UserState(chat_id=238413746,
-    #                        state_fun='[<function process_type at 0x7fb333c9dc80>]')
-    #
-    # result = session.query(UserState).all()
-    #
-    # for obj in result:
-    #     print(obj.chat_id, obj.state_fun)
-    #
-    # result_dict = {obj.chat_id: obj.state_fun for obj in result}
-    #
-    # session.commit()
-    # session.close()

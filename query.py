@@ -19,8 +19,7 @@ class Query:
     def __init__(self, chat_id):
         try:
             session = Session()
-            login = session.query(UserState).filter(UserState.chat_id == chat_id).one().login
-            user = session.query(UserMap).filter(UserMap.login == login).one()
+            user = session.query(UserState).filter(UserState.chat_id == chat_id).one().user
             session.close()
 
             self.dw = datawiz.DW(user.login, user.password)
