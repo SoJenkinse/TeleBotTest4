@@ -140,13 +140,13 @@ def alerts_generator():
     date_types = {'everyday': everyday, 'week_start': week_start, 'week_end': week_end,
                   'month_start': month_start, 'month_end': month_end}
 
-    while True:
-        session = Session()
-        alerts = session.query(UserAlert).all()
-        session.close()
+    # while True:
+    session = Session()
+    alerts = session.query(UserAlert).all()
+    session.close()
 
-        today = datetime.datetime.today()
+    today = datetime.datetime.today()
 
-        yield [alert for alert in alerts if date_types[alert.alert_date](today).date() == today.date()]
+    return [alert for alert in alerts if date_types[alert.alert_date](today).date() == today.date()]
 
 

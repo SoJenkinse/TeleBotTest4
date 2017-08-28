@@ -22,6 +22,7 @@ from dwapi import datawiz
 from telebot import types
 
 import matplotlib
+
 matplotlib.use("agg")  # switch to png mode
 import matplotlib.pyplot as plt
 
@@ -191,7 +192,7 @@ def process_settings_handler(message):
                 alert_date = alert_dates[alerts[i].alert_date].lower()
                 alert_time = str(alerts[i].alert_time)[:-3]
                 query_type = type_map[alerts[i].query_type].lower()
-                values.append(u'№' + str(i+1) + u', ' + alert_date + u', ' + alert_time + u', ' + query_type)
+                values.append(u'№' + str(i + 1) + u', ' + alert_date + u', ' + alert_time + u', ' + query_type)
 
             add_text = text[u'alerts_menu_values'][u'add']
             done_text = text[u'alerts_menu_values'][u'done']
@@ -296,7 +297,7 @@ def process_settings_handler(message):
 
         elif message.text == language_menu_text:
             user = session.query(UserState).filter(UserState.chat_id == chat_id).one().user
-            markup = create_markup(language_values_dict[user.lang])
+            markup = create_markup(language_values_dict[user.lang], resize_keyboard=True)
             bot.send_message(chat_id, text[u'choose_lang'], reply_markup=markup)
             bot.register_next_step_handler(message, process_settings_language)
 
@@ -342,7 +343,7 @@ def process_settings_language(message):
 
 
 def process_settings_timezone(message):
-    if check_message(message) is False:
+    if not check_message(message):
         return
     try:
         chat_id = message.chat.id
@@ -460,7 +461,7 @@ def process_settings_time(message):
         rollback_state(message, 'settings')
 
 
-@bot.message_handler(func= lambda m: m.text[:4].lower() == u'вхід' or m.text[:4].lower() == u'вход')
+@bot.message_handler(func=lambda m: m.text[:4].lower() == u'вхід' or m.text[:4].lower() == u'вход')
 def process_login(message):
     try:
         chat_id = message.chat.id
@@ -486,7 +487,8 @@ def process_login(message):
         else:
             # create values for new markup, languages
             markup = create_markup([u'🇷🇺 Російська', u'🇺🇦 Українська'], resize_keyboard=True)
-            msg = bot.send_message(chat_id, u'Ласкаво просимо %s! Будь ласка, виберіть мову' % login, reply_markup=markup)
+            msg = bot.send_message(chat_id, u'Ласкаво просимо %s! Будь ласка, виберіть мову' % login,
+                                   reply_markup=markup)
             logging.info(u'ENTER ' + str(chat_id) + u' ' + login)
             bot.register_next_step_handler(msg, process_language)
 
@@ -498,7 +500,7 @@ def process_login(message):
         rollback_state(message, 'start')
 
 
-@bot.message_handler(func= lambda m: m.text.lower() == u'выход' or m.text.lower() == u'вихід')
+@bot.message_handler(func=lambda m: m.text.lower() == u'выход' or m.text.lower() == u'вихід')
 def process_exit(message):
     try:
         chat_id = message.chat.id
@@ -752,7 +754,7 @@ def process_shop(message):
             shops_info = {value: key for key, value in shops_info.iteritems()}
 
             r_server.hset(chat_id, 'shops_type', message.text)
-            r_server.hset(chat_id, 'shop', shops_string_dict_rev.get(message.text, shops_info[message.text]))
+            r_server.hset(chat_id, 'shop', shops_info.get(message.text, '-1'))
 
             shops_text = text[u'shops_choosen'] + u' ' + message.text + u'\n\n'
             to_main_menu(message, shops_text)
@@ -875,7 +877,7 @@ def process_calendar(message):
         user = session.query(UserState).filter(UserState.chat_id == chat_id).one().user
         session.close()
 
-        markup = create_calendar(now.year,now.month, language_to_system_default.get(user.lang))
+        markup = create_calendar(now.year, now.month, language_to_system_default.get(user.lang))
         bot.send_message(message.chat.id, text[u'please_choose_period'], reply_markup=markup)
         save_state(chat_id)
     except Exception as e:
@@ -953,7 +955,7 @@ def create_message(chat_id, frame, query):
         sr = sr.reindex(index_order)
 
     for ind in sr.index.values:
-        message += query.type_translate(ind) + u': ' + str(sr[ind]) +\
+        message += query.type_translate(ind) + u': ' + str(sr[ind]) + \
                    u'  (' + str(percent[ind].iloc[0].round(2)) + u'%)\n'
     message += u'\n'
     return [message]
@@ -990,7 +992,7 @@ def create_all_shops_message(frame, query):
         message = u'' + query.type_translate(frame.index[0]) + u'\n'
         for col in frame:
             specific_percent = percent[percent.shop_name == frame[col].name]
-            message += frame[col].name + u': ' + str(frame[col][0].round(2)) + u' (' +\
+            message += frame[col].name + u': ' + str(frame[col][0].round(2)) + u' (' + \
                        str(specific_percent[frame.index[0]].iloc[0].round(2)) + u'%)\n'
 
         messages = split_if_too_large(message)
@@ -1056,8 +1058,8 @@ def create_visualization(query, frame, vis_type='line'):
     # clear plots
     for col in frame.columns.values:
         plt.figure(col + str(query.chat_id),
-                            figsize=(16, 10),
-                            dpi=160)
+                   figsize=(16, 10),
+                   dpi=160)
         plt.clf()
     columns = frame.columns.values
 
@@ -1067,7 +1069,7 @@ def create_visualization(query, frame, vis_type='line'):
     for col in columns:
         item = frame[col]
         figure = plt.figure(col + str(query.chat_id),
-                            figsize=(16,8),
+                            figsize=(16, 8),
                             dpi=160)
         plt.ylabel(query.type_translate(col))
         ax = figure.gca()
@@ -1112,17 +1114,17 @@ def create_excel(query, frame):
 
     frame = frame[:-1].copy()
     frame = frame.append(frame.sum(numeric_only=True), ignore_index=True)
-    frame.set_value(len(frame)-1, 'date', frame.iloc[0]['date'] + u' - ' + frame.iloc[len(frame)-2]['date'])
+    frame.set_value(len(frame) - 1, 'date', frame.iloc[0]['date'] + u' - ' + frame.iloc[len(frame) - 2]['date'])
 
     rename_map = {'turnover': text['types_values'][0],
-                'qty': text['types_values'][1],
-                'profit': text['types_values'][2],
-                'receipts_qty': text['types_values'][3],
-                'date': text['period_nic']
-                }
+                  'qty': text['types_values'][1],
+                  'profit': text['types_values'][2],
+                  'receipts_qty': text['types_values'][3],
+                  'date': text['period_nic']
+                  }
 
     frame = frame.rename(columns=rename_map)
-    frame = frame.rename({len(frame)-1: text['total']})
+    frame = frame.rename({len(frame) - 1: text['total']})
 
     if isinstance(shop_name, int):
         shop_name = str(shop_name)
@@ -1174,12 +1176,12 @@ def next_month(call):
 
     saved_date = current_shown_dates.get(chat_id)
     if saved_date is not None:
-        year,month = saved_date
-        month+=1
-        if month>12:
-            month=1
-            year+=1
-        date = (year,month)
+        year, month = saved_date
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+        date = (year, month)
         current_shown_dates[chat_id] = date
 
         # get user for localization
@@ -1187,12 +1189,13 @@ def next_month(call):
         user = session.query(UserState).filter(UserState.chat_id == chat_id).one().user
         session.close()
 
-        markup = create_calendar(year,month, language_to_system_default.get(user.lang))
+        markup = create_calendar(year, month, language_to_system_default.get(user.lang))
 
-        bot.edit_message_text(text['please_choose_period'], call.from_user.id, call.message.message_id, reply_markup=markup)
+        bot.edit_message_text(text['please_choose_period'], call.from_user.id, call.message.message_id,
+                              reply_markup=markup)
         bot.answer_callback_query(call.id, text="")
     else:
-        #Do something to inform of the error
+        # Do something to inform of the error
         pass
 
 
@@ -1203,12 +1206,12 @@ def previous_month(call):
 
     saved_date = current_shown_dates.get(chat_id)
     if saved_date is not None:
-        year,month = saved_date
-        month-=1
-        if month<1:
-            month=12
-            year-=1
-        date = (year,month)
+        year, month = saved_date
+        month -= 1
+        if month < 1:
+            month = 12
+            year -= 1
+        date = (year, month)
         current_shown_dates[chat_id] = date
 
         # get user for localization
@@ -1216,8 +1219,9 @@ def previous_month(call):
         user = session.query(UserState).filter(UserState.chat_id == chat_id).one().user
         session.close()
 
-        markup = create_calendar(year,month, language_to_system_default.get(user.lang))
-        bot.edit_message_text(text['please_choose_period'], call.from_user.id, call.message.message_id, reply_markup=markup)
+        markup = create_calendar(year, month, language_to_system_default.get(user.lang))
+        bot.edit_message_text(text['please_choose_period'], call.from_user.id, call.message.message_id,
+                              reply_markup=markup)
         bot.answer_callback_query(call.id, text="")
     else:
         pass
@@ -1231,7 +1235,7 @@ def get_day(call):
     saved_date = current_shown_dates.get(chat_id)
     if saved_date is not None:
         day = call.data[13:]
-        date_choosen = datetime.datetime(int(saved_date[0]),int(saved_date[1]),int(day))
+        date_choosen = datetime.datetime(int(saved_date[0]), int(saved_date[1]), int(day))
 
         date_from = r_server.hget(str(chat_id), 'date_from')
         date_to = r_server.hget(str(chat_id), 'date_to')
@@ -1298,8 +1302,8 @@ def save_state(chat_id):
 
         # only one function can be located in pre_message_subscribers_next_step
         if len(value) > 1:
-            value = value[0]
-            bot.pre_message_subscribers_next_step[chat_id] = [value]
+            value = [value[0]]
+            bot.pre_message_subscribers_next_step[chat_id] = value
 
         value = value[0].__name__
         session = Session()
@@ -1338,6 +1342,7 @@ def clear_states():
         session.close()
     except Exception as e:
         logging.error('clear_states ' + str(e))
+
 
 # clear_states()
 load_state()

@@ -62,7 +62,7 @@ class UserAlert(Base):
     user = relationship("UserMap", back_populates="alerts")
 
     def __str__(self):
-        return str(self.chat_id) + ' ' + self.login + ' ' + self.query_type
+        return str(self.alert_date) + ' ' + str(self.user_id) + ' ' + str(self.alert_time)
 
 UserMap.alerts = relationship("UserAlert", order_by=UserAlert.id, back_populates="user")
 UserMap.states = relationship("UserState", order_by=UserState.chat_id, back_populates="user")
